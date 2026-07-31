@@ -22,7 +22,15 @@ def get_base_figure():
     return fig
 
 
-def add_design_trace(fig, df_sp):
+def _stride_sample(df, max_shown):
+    """降采样：按均匀间隔取子集，保证全图范围仍有点显示"""
+    if max_shown is None or max_shown <= 0 or len(df) <= max_shown:
+        return df
+    step = int(len(df) / max_shown) + 1
+    return df.iloc[::step]
+
+
+def add_design_trace(fig, df_sp, max_shown=None):
     """单独添加设计点层 (灰色)"""
     if df_sp is None or df_sp.empty:
         return fig
@@ -33,19 +41,22 @@ def add_design_trace(fig, df_sp):
     df['Y'] = pd.to_numeric(df['Y'], errors='coerce')
     df = df.dropna(subset=['X', 'Y'])
 
-    fig.add_trace(go.Scatter(
+    show_hover = max_shown is None or len(df) <= max_shown
+    df = _stride_sample(df, max_shown)
+
+    fig.add_trace(go.Scattergl(
         x=df['X'],
         y=df['Y'],
         mode='markers',
         name='设计 SPS',
         marker=dict(size=0.5, color='lightgray', symbol='circle'),
-        hovertext="设计 线:" + df['Line'].astype(str) + " 点:" + df['Point'].astype(str),
-        hoverinfo="text"
+        hovertext="设计 线:" + df['Line'].astype(str) + " 点:" + df['Point'].astype(str) if show_hover else None,
+        hoverinfo="text" if show_hover else "skip"
     ))
     return fig
 
 
-def add_production_trace(fig, df_obs):
+def add_production_trace(fig, df_obs, max_shown=None):
     """单独添加实际生产层 (亮绿色)"""
     if df_obs is None or df_obs.empty:
         return fig
@@ -57,7 +68,10 @@ def add_production_trace(fig, df_obs):
     df['Northing (m)'] = pd.to_numeric(df['Northing (m)'], errors='coerce')
     df = df.dropna(subset=['Easting (m)', 'Northing (m)'])
 
-    fig.add_trace(go.Scatter(
+    show_hover = max_shown is None or len(df) <= max_shown
+    df = _stride_sample(df, max_shown)
+
+    fig.add_trace(go.Scattergl(
         x=df['Easting (m)'],
         y=df['Northing (m)'],
         mode='markers',
@@ -68,12 +82,12 @@ def add_production_trace(fig, df_obs):
             symbol='circle',
             # line=dict(width=1, color='white')
         ),
-        hovertext="实际 线:" + df['Line Name'].astype(str) + " 点:" + df['Point Number'].astype(str),
-        hoverinfo="text+x+y"
+        hovertext="实际 线:" + df['Line Name'].astype(str) + " 点:" + df['Point Number'].astype(str) if show_hover else None,
+        hoverinfo="text+x+y" if show_hover else "skip"
     ))
     return fig
 
-def add_production_sps(fig, df_obs):
+def add_production_sps(fig, df_obs, max_shown=None):
     """单独添加实际生产层 (亮绿色)"""
     if df_obs is None or df_obs.empty:
         return fig
@@ -85,7 +99,10 @@ def add_production_sps(fig, df_obs):
     df['Y'] = pd.to_numeric(df['Y'], errors='coerce')
     df = df.dropna(subset=['X', 'Y'])
 
-    fig.add_trace(go.Scatter(
+    show_hover = max_shown is None or len(df) <= max_shown
+    df = _stride_sample(df, max_shown)
+
+    fig.add_trace(go.Scattergl(
         x=df['X'],
         y=df['Y'],
         mode='markers',
@@ -93,14 +110,14 @@ def add_production_sps(fig, df_obs):
         marker=dict(
             size=1,
             # color='#00CC96',
-            color=df['Elevation'],
+            color=df['Elevation'] if len(df) else None,
             colorscale='Viridis',  # 推荐色阶：Viridis, Plasma, Terrain 等
             showscale=True,
             symbol='circle',
             # line=dict(width=1, color='white')
         ),
-        hovertext="实际 线:" + df['Line'].astype(str) + " 点:" + df['Point'].astype(str),
-        hoverinfo="text+x+y"
+        hovertext="实际 线:" + df['Line'].astype(str) + " 点:" + df['Point'].astype(str) if show_hover else None,
+        hoverinfo="text+x+y" if show_hover else "skip"
     ))
     return fig
 

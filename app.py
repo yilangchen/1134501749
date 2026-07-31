@@ -3,6 +3,7 @@ import pandas as pd
 import sqlite3
 import Tool
 import os
+import re
 import datetime
 
 os.system('cls' if os.name == 'nt' else 'clear')
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS design_point (
     x          REAL,
     y          REAL,
     batch_src  TEXT,
+    swath      TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (project_id, line, point)
 );
@@ -47,6 +49,7 @@ CREATE TABLE IF NOT EXISTS shot_attempt (
     design_point_id INTEGER NOT NULL REFERENCES design_point(id)  ON DELETE CASCADE,
     elevation       REAL,
     gps_time        TEXT,
+    swath           TEXT,
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -58,10 +61,10 @@ CREATE INDEX IF NOT EXISTS idx_shot_attempt_designpt ON shot_attempt (design_poi
 """)
 conn.commit()
 # --- 1. 页面基本配置 (UI设置) ---
-st.set_page_config(page_title="生产看板", layout="wide")
+st.set_page_config(page_title="Crew S90", layout="wide")
 st.title("设计 SPS 与 生产 SPS 查看")
 
-tab1, tab2 = st.tabs(["画图", " 助手"])
+tab1, tab2 = st.tabs(["S90 生产进度", " S90 助手"])
 with tab1:
     with st.sidebar:
         st.header("数据导入中心")
@@ -79,7 +82,7 @@ with tab1:
             target_project_name = st.text_input("请输入工区名称 (如: 工区1)", "工区1")
         else:
             target_project_name = selected_option
-        sp_file = st.file_uploader("1. 上传to_recorder (SPS)", type=['sps', 's', 'S01'])
+        sp_files = st.file_uploader("1. 上传to_recorder (SPS)", type=['sps', 's', 'S01'], accept_multiple_files=True)
         sps_file = st.file_uploader("2. 上传生产obs (SPS)", type=['sps', 's', 'S01', 'csv'])
         target_date = st.date_input("选择作业日期", datetime.date.today())
         daily_sps_file = st.file_uploader("2. 上传生产daily SPS", type=['sps', 's'], accept_multiple_files=True)
@@ -100,8 +103,16 @@ with tab1:
         conn.commit()
         return c.lastrowid, True
 
-    if sp_file:
-        # 读取 设计SPS
+    def extract_swath(filename):
+        """从文件名提取 swath 号，如 'sw123_sps_for_recorder.sps' -> 'sw123'"""
+        if not filename:
+            return None
+        name = filename.split('/')[-1]  # 去路径
+        m = re.search(r'(sw\d+)', name.lower())
+        return m.group(1) if m else None
+
+    if sp_files:
+        # 读取 设计SPS（支持多文件，逐文件解析后合并）
         @st.cache_data
         def smart_read_csv(uploaded_file, column_names=None):
             # 1. 先将文件内容读取为字符串列表，寻找起始行
@@ -121,7 +132,12 @@ with tab1:
             return df
 
         custom_columns = ['S', 'Line', 'Point', 'X', 'Y']
-        df_sp = smart_read_csv(sp_file, custom_columns)
+        parts = []
+        for f in sp_files:
+            df_f = smart_read_csv(f, custom_columns)
+            df_f['Swath'] = extract_swath(f.name)
+            parts.append(df_f)
+        df_sp = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
     if sps_file:
         # 读取每日obs
@@ -152,6 +168,7 @@ with tab1:
                                  header=None,  # 无表头
                                  names=['S', 'Line', 'Point', 'index', 'X', 'Y', 'Elevation', 'GPS Time'],
                                  engine='python')
+                df['Swath'] = extract_swath(file.name)
                 df_.append(df)
             if df_:
                 return pd.concat(df_, ignore_index=True)
@@ -166,14 +183,15 @@ with tab1:
         if df_sp is not None and not df_sp.empty:
             try:
                 # 幂等导入：已存在的 (line,point) 更新坐标并追加批次标签，新点直接插入
-                params = [(project_id, row['Line'], row['Point'], row['X'], row['Y'], target_batch)
-                          for _, row in df_sp.iterrows()]
+                params = [(project_id, row['Line'], row['Point'], row['X'], row['Y'],
+                           target_batch, row.get('Swath')) for _, row in df_sp.iterrows()]
                 c.executemany("""
-                              INSERT INTO design_point (project_id, line, point, x, y, batch_src)
-                              VALUES (?, ?, ?, ?, ?, ?)
+                              INSERT INTO design_point (project_id, line, point, x, y, batch_src, swath)
+                              VALUES (?, ?, ?, ?, ?, ?, ?)
                               ON CONFLICT (project_id, line, point) DO UPDATE SET
                                   x = excluded.x,
                                   y = excluded.y,
+                                  swath = COALESCE(excluded.swath, design_point.swath),
                                   batch_src = CASE
                                       WHEN design_point.batch_src IS NULL OR design_point.batch_src = '' THEN excluded.batch_src
                                       WHEN instr(',' || design_point.batch_src || ',', ',' || excluded.batch_src || ',') > 0 THEN design_point.batch_src
@@ -205,22 +223,41 @@ with tab1:
                                   (project_id, target_date)).fetchone()[0]
 
                 rows = []
+                skip_swath = 0
                 for _, row in daily_sps.iterrows():
-                    dp = c.execute("""
-                                   SELECT id FROM design_point
-                                   WHERE project_id = ? AND line = ? AND point = ?
-                                   """, (project_id, row['Line'], row['Point'])).fetchone()
+                    if row.get('Swath'):
+                        dp = c.execute("""
+                                       SELECT id FROM design_point
+                                       WHERE project_id = ? AND line = ? AND point = ? AND swath = ?
+                                       """, (project_id, row['Line'], row['Point'], row['Swath'])).fetchone()
+                        if dp is None:
+                            # 退而求其次：该工区确实有这个设计点，只是 swath 标注不一致
+                            alt = c.execute("""
+                                            SELECT id FROM design_point
+                                            WHERE project_id = ? AND line = ? AND point = ?
+                                            """, (project_id, row['Line'], row['Point'])).fetchone()
+                            if alt is not None:
+                                skip_swath += 1
+                        dp = dp or alt
+                    else:
+                        dp = c.execute("""
+                                       SELECT id FROM design_point
+                                       WHERE project_id = ? AND line = ? AND point = ?
+                                       """, (project_id, row['Line'], row['Point'])).fetchone()
                     if dp is None:
                         continue
-                    rows.append((wd_id, dp[0], row['Elevation'], row['GPS Time']))
+                    rows.append((wd_id, dp[0], row['Elevation'], row['GPS Time'], row.get('Swath')))
 
                 if rows:
                     c.executemany("""
-                                  INSERT INTO shot_attempt (work_day_id, design_point_id, elevation, gps_time)
-                                  VALUES (?, ?, ?, ?)
+                                  INSERT INTO shot_attempt (work_day_id, design_point_id, elevation, gps_time, swath)
+                                  VALUES (?, ?, ?, ?, ?)
                                   """, rows)
                     conn.commit()
-                    st.sidebar.success(f"✅ {target_date} 的数据已入库！匹配 {len(rows)} 个设计点")
+                    msg = f"✅ {target_date} 的数据已入库！匹配 {len(rows)} 个设计点"
+                    if skip_swath:
+                        msg += f"（{skip_swath} 炮 swath 标注不一致，已按设计点归属）"
+                    st.sidebar.success(msg)
                 else:
                     st.sidebar.warning("没有匹配到设计点的生产记录")
             except Exception as e:
@@ -228,6 +265,7 @@ with tab1:
 
     # 画图
     with col_chart:
+        quick_mode = st.checkbox("⚡ 快速模式（降采样，点太多时推荐）", value=False)
         subcol_1, subcol_2, subcol_3, subcol_4 = st.columns([1, 1, 1, 1])
         with subcol_1:
             plot_project_options = project_list if project_list else ["工区1"]
@@ -237,12 +275,38 @@ with tab1:
         with subcol_3:
             selected_pro2 = st.date_input("结束日期")
 
+        # 该工区已有的 swath 列表（供筛选）
+        try:
+            swath_df = pd.read_sql("""
+                                   SELECT DISTINCT dp.swath FROM design_point dp
+                                   JOIN project p ON p.id = dp.project_id
+                                   WHERE p.name = ? AND dp.swath IS NOT NULL AND dp.swath <> ''
+                                   ORDER BY dp.swath
+                                   """, conn, params=(selected_project,))
+            swath_list = swath_df["swath"].tolist()
+        except:
+            swath_list = []
+        selected_swaths = st.multiselect("按 swath 筛选（留空 = 全部）", swath_list)
+
         if subcol_4.button("Plot"):
 
             @st.cache_data
-            def load_all_designs(project_name):
+            def load_all_designs(project_name, swaths=()):
                 if not project_name:
                     return pd.DataFrame()
+                if swaths:
+                    placeholders = ', '.join(['?'] * len(swaths))
+                    query = f"""
+                            SELECT dp.line  as Line,
+                                   dp.point as Point,
+                                   dp.x     as X,
+                                   dp.y     as Y
+                            FROM design_point dp
+                            JOIN project p ON p.id = dp.project_id
+                            WHERE p.name = ? AND dp.swath IN ({placeholders})
+                            ORDER BY dp.line, dp.point
+                            """
+                    return pd.read_sql(query, conn, params=[project_name] + list(swaths))
                 query = """
                         SELECT dp.line  as Line,
                                dp.point as Point,
@@ -255,10 +319,29 @@ with tab1:
                         """
                 return pd.read_sql(query, conn, params=(project_name,))
 
-            df_design = load_all_designs(selected_project)
+            df_design = load_all_designs(selected_project, tuple(selected_swaths))
 
             @st.cache_data
-            def load_daily_sps(project_name, start_date, end_date):
+            def load_daily_sps(project_name, start_date, end_date, swaths=()):
+                if swaths:
+                    placeholders = ', '.join(['?'] * len(swaths))
+                    query = f"""
+                            SELECT dp.line      as Line,
+                                   dp.point     as Point,
+                                   dp.x         as X,
+                                   dp.y         as Y,
+                                   sa.elevation as Elevation,
+                                   wd.work_date
+                            FROM shot_attempt sa
+                            JOIN design_point dp ON dp.id = sa.design_point_id
+                            JOIN work_day wd ON wd.id = sa.work_day_id
+                            JOIN project p ON p.id = wd.project_id
+                            WHERE p.name = ? AND wd.work_date BETWEEN ? AND ?
+                              AND dp.swath IN ({placeholders})
+                            ORDER BY wd.work_date, dp.line, dp.point
+                            """
+                    return pd.read_sql(query, conn,
+                                      params=[project_name, start_date, end_date] + list(swaths))
                 query = """
                         SELECT dp.line      as Line,
                                dp.point     as Point,
@@ -278,19 +361,20 @@ with tab1:
                     conn,
                     params=(project_name, start_date, end_date)
                 )
-            df_daily = load_daily_sps(selected_project, selected_pro1, selected_pro2)
+            df_daily = load_daily_sps(selected_project, selected_pro1, selected_pro2, tuple(selected_swaths))
 
             fig = Tool.get_base_figure()
+            max_shown = 20_000 if quick_mode else None
             if 'df_design' in locals() and not df_design.empty:
-                fig = Tool.add_design_trace(fig, df_design)
+                fig = Tool.add_design_trace(fig, df_design, max_shown=max_shown)
             if 'df_daily' in locals() and not df_daily.empty:
-                fig = Tool.add_production_sps(fig, df_daily)
+                fig = Tool.add_production_sps(fig, df_daily, max_shown=max_shown)
             if 'df_sps' in locals() and not df_sps.empty:
-                fig = Tool.add_production_trace(fig, df_sps)
+                fig = Tool.add_production_trace(fig, df_sps, max_shown=max_shown)
             st.plotly_chart(fig)
 
-            st.session_state.df_design = load_all_designs(selected_project)
-            st.session_state.df_daily = load_daily_sps(selected_project, selected_pro1, selected_pro2)
+            st.session_state.df_design = load_all_designs(selected_project, tuple(selected_swaths))
+            st.session_state.df_daily = load_daily_sps(selected_project, selected_pro1, selected_pro2, tuple(selected_swaths))
 
     with col_stats:
         st.markdown("### 📊 生产统计")
