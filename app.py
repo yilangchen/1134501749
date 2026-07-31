@@ -400,8 +400,8 @@ with tab1:
             else:
                 st.write('No production')   # 无数据显示占位
 
-    col_1, col_2, col_3 = st.columns([1, 1, 1])   # 三个等宽列放管理区
-    st.divider()                                  # 分隔线
+    col_1, col_3 = st.columns([1, 1])   # 两列等宽放管理区
+    st.divider()                        # 分隔线
     with col_1:
         st.subheader("💾 库内工区管理")
         try:
@@ -414,24 +414,20 @@ with tab1:
                                      """, conn)   # 各工区及其设计点数
 
             if not db_summary.empty:
-                with st.container(height=400, border=True):   # 可滚动容器
+                with st.container(height=250, border=True):   # 可滚动容器，缩小高度
                     for _, row in db_summary.iterrows():      # 逐工区显示
                         col_d, col_b = st.columns([2, 1])     # 左名字右删除按钮
                         col_d.write(f"📅 {row['name']} ({row['count']} 炮)")   # 工区名+点数
-                        if col_b.button("删除", key=f"btn_p_{row['id']}"):     # 删除按钮
+                        if col_b.button("删除", key=f"btn_p_{row['id']}"):    # 删除按钮
                             c.execute("DELETE FROM project WHERE id = ?", (row['id'],))  # 删工区（级联删子表）
-                            conn.commit()
-                            st.toast(f"已删除 {row['name']} 的数据")   # 提示删除成功
-                            st.rerun()   # 刷新页面
+                            conn.commit()                                       # 提交删除
             else:
                 st.write("数据库尚无记录")   # 空库提示
         except:
             st.write("等待初始化...")   # 表未建好时兜底
-    with col_2:
-        st.subheader("💾 库内数据管理")   # 预留的管理列
 
     with col_3:
-        st.subheader("💾 库内daily sps 管理")
+        st.subheader("📅 库内daily sps 管理")
         # 查询数据库中已有的日期和炮数
         try:
             db_summary = pd.read_sql("""
@@ -443,16 +439,14 @@ with tab1:
                                      """, conn)   # 各作业日及其炮数
 
             if not db_summary.empty:
-                with st.container(height=400, border=True):   # 可滚动容器
-                    for _, row in db_summary.iterrows():      # 逐日期显示
+                with st.container(height=250, border=True):   # 可滚动容器，缩小高度
+                    for _, row in db_summary.iterrows():      # 逐日显示
                         col_d, col_b = st.columns([2, 1])     # 左日期右删除按钮
-                        col_d.write(f"📅 {row['work_date']} ({row['count']} 炮)")   # 日期+炮数
-                        if col_b.button("删除", key=f"btn_wd_{row['id']}"):         # 删除按钮
+                        col_d.write(f"📅 {row['work_date']} ({row['count']} 炮)")  # 日期+炮数
+                        if col_b.button("删除", key=f"btn_wd_{row['id']}"):        # 删除按钮
                             c.execute("DELETE FROM work_day WHERE id = ?", (row['id'],))  # 删作业日（级联删当天炮）
-                            conn.commit()
-                            st.toast(f"已删除 {row['work_date']} 的数据")   # 提示删除成功
-                            st.rerun()   # 刷新页面
+                            conn.commit()   # 提交删除
             else:
                 st.write("数据库尚无记录")   # 空库提示
-        except:
-            st.write("等待初始化...")   # 表未建好时兜底
+        except Exception as e:
+            st.write("读取数据时出错，请刷新页面")  # 异常提示
