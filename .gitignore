@@ -1,0 +1,39 @@
+.idea
+
+#
+*.npy
+
+#
+*.db
+
+*.sql
+# macOS
+
+.DS_Store
+
+._*
+# 虚拟环境
+
+venv/
+
+.venv/
+# numpy
+
+*.npy
+
+# pickle
+
+*.pkl
+
+# 日志
+
+*.log
+# VSCode
+
+.vscode/
+
+# Python缓存
+
+__pycache__/
+
+*.pyc
