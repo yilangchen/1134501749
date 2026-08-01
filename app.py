@@ -2,6 +2,8 @@ import streamlit as st      # Streamlit：Web 界面框架，负责页面渲染�
 import pandas as pd         # pandas：表格数据处理，读 SPS 文件、统计查询结果
 import sqlite3              # sqlite3：连接 SQLite 数据库，执行 SQL
 import Tool                 # 本地绘图工具模块，封装 Plotly 图表函数
+import dbtool               # 本地 agent 工具，流式问答
+from openai import OpenAI   # OpenAI SDK：调用 /models 接口拉取模型列表
 import os                   # os：执行清屏命令
 import re                   # re：正则表达式，从文件名提取 swath 号
 import datetime             # datetime：提供日期输入框的默认值
@@ -450,3 +452,93 @@ with tab1:
                 st.write("数据库尚无记录")   # 空库提示
         except Exception as e:
             st.write("读取数据时出错，请刷新页面")  # 异常提示
+
+with tab2:
+    st.subheader("🤖 S90 助手")   # 助手标题
+
+    # --- 初始化 session_state ---
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []   # 聊天历史：[(role, msg), ...]
+    if "agent" not in st.session_state:
+        st.session_state.agent = None        # 当前 agent 实例，配置后才有
+    if "model_list" not in st.session_state:
+        st.session_state.model_list = []     # 可用模型列表
+
+    # --- 配置区：base_url + api_key → 拉模型列表 ---
+    col1, col2, col3 = st.columns([2, 3, 2])   # 三列布局
+    with col1:
+        base_url = st.text_input("API 地址", "https://api.openai.com/v1")  # API 地址
+    with col2:
+        api_key = st.text_input("API Key", type="password")   # API 密钥，隐藏显示
+    with col3:
+        st.write("")   # 占位对齐
+        fetch_models = st.button("获取模型", use_container_width=True)   # 拉模型按钮
+
+    if fetch_models and api_key:
+        try:
+            client = OpenAI(base_url=base_url, api_key=api_key)  # 用用户提供的地址和 key 建客户端
+            models_resp = client.models.list()                   # 拉取所有模型
+            model_ids = [m.id for m in models_resp]              # 直接遍历 SyncPage 对象
+            st.session_state.model_list = sorted(model_ids)      # 按名字排序
+            st.success(f"获取到 {len(st.session_state.model_list)} 个模型")
+        except Exception as e:
+            st.error(f"获取模型失败: {e}")   # 提示错误
+            st.session_state.model_list = []
+
+    # --- 模型选择 ---
+    if st.session_state.model_list:
+        selected_model = st.selectbox("选择模型", st.session_state.model_list)  # 下拉选模型
+    else:
+        selected_model = st.text_input("手动输入模型名", "gpt-4o")   # 没拉列表时手动输
+
+    # --- 初始化 agent ---
+    if st.button("连接助手") and api_key:
+        if base_url and selected_model:
+            try:
+                st.session_state.agent = dbtool.Productiontool(
+                    db_path=DB_FILE,
+                    api_key=api_key,
+                    model_name=selected_model,
+                    base_url=base_url
+                )   # 创建 agent 实例，关掉 temperature 保证稳定
+                st.session_state.chat_history = []   # 清空历史
+                st.success("Agent 已就绪")
+            except Exception as e:
+                st.error(f"初始化失败: {e}")
+
+    st.divider()
+
+    # --- 显示历史消息 ---
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])   # 逐条渲染历史
+
+    # --- 快捷提问 ---
+    with st.expander("💡 提示示例"):
+        st.write("• 有哪些工区？")
+        st.write("• 本月生产了多少炮？")
+        st.write("• 最近 7 天每天的炮数")
+        st.write("• 当前完成进度？")
+
+    # --- 聊天输入 ---
+    user_input = st.chat_input("输入问题...")
+
+    if user_input:
+        if not st.session_state.agent:
+            st.warning("请先配置 API Key 并初始化 Agent")  # 未就绪时提示
+        else:
+            st.session_state.chat_history.append({"role": "user", "content": user_input})  # 保存用户消息
+            with st.chat_message("user"):
+                st.write(user_input)   # 回显用户消息
+
+            with st.chat_message("assistant"):
+                placeholder = st.empty()   # 占位框，逐 token 填充
+                full_response = ""
+                try:
+                    for chunk in st.session_state.agent.ask_stream(user_input):
+                        full_response += chunk   # 累加 token
+                        placeholder.markdown(full_response)   # 实时更新显示
+                except Exception as e:
+                    placeholder.error(f"出错了: {e}")
+                    full_response = f"[错误] {e}"
+                st.session_state.chat_history.append({"role": "assistant", "content": full_response})  # 保存回复
