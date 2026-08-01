@@ -3,7 +3,7 @@ import pandas as pd         # pandas：表格数据处理，读 SPS 文件、统
 import sqlite3              # sqlite3：连接 SQLite 数据库，执行 SQL
 import Tool                 # 本地绘图工具模块，封装 Plotly 图表函数
 import dbtool               # 本地 agent 工具，流式问答
-from openai import OpenAI   # OpenAI SDK：调用 /models 接口拉取模型列表
+import requests             # requests：直接调 /models 接口拉取模型列表
 import os                   # os：执行清屏命令
 import re                   # re：正则表达式，从文件名提取 swath 号
 import datetime             # datetime：提供日期输入框的默认值
@@ -474,22 +474,35 @@ with tab2:
         st.write("")   # 占位对齐
         fetch_models = st.button("获取模型", use_container_width=True)   # 拉模型按钮
 
-    if fetch_models and api_key:
-        try:
-            client = OpenAI(base_url=base_url, api_key=api_key)  # 用用户提供的地址和 key 建客户端
-            models_resp = client.models.list()                   # 拉取所有模型
-            model_ids = [m.id for m in models_resp]              # 直接遍历 SyncPage 对象
-            st.session_state.model_list = sorted(model_ids)      # 按名字排序
-            st.success(f"获取到 {len(st.session_state.model_list)} 个模型")
-        except Exception as e:
-            st.error(f"获取模型失败: {e}")   # 提示错误
-            st.session_state.model_list = []
+    # 填好地址和 key 后自动拉取模型，或点按钮手动刷新
+    if (fetch_models or (base_url and api_key)) and "last_models_fetched" not in st.session_state:
+        st.session_state.last_models_fetched = True   # 标记：只自动拉一次，之后手动刷新
+        with st.spinner("正在获取模型列表..."):   # 等待时显示加载动画
+            try:
+                # 拼接 /models 接口地址：base_url 去掉末尾 / 再补 /models
+                models_url = base_url.rstrip("/") + "/models"
+                resp = requests.get(models_url,    # 直接调用模型列表接口
+                                    headers={"Authorization": f"Bearer {api_key}"},
+                                    timeout=15)    # 15 秒超时，防止卡死
+                if resp.status_code == 200:        # 请求成功
+                    data = resp.json()             # 解析返回 JSON
+                    model_ids = [m["id"] for m in data.get("data", [])]   # 提取模型 ID 列表
+                    st.session_state.model_list = sorted(model_ids)       # 排序保存
+                    st.success(f"获取到 {len(model_ids)} 个模型")
+                else:
+                    # 非 200：显示状态码和接口返回的错误信息，方便排查
+                    st.error(f"获取模型失败 HTTP {resp.status_code}：{resp.text[:200]}")
+                    st.session_state.model_list = []   # 清空列表
+            except Exception as e:
+                # 网络错误/地址不对等异常，提示用户检查地址
+                st.error(f"获取模型失败：{e}")
+                st.session_state.model_list = []   # 清空列表
 
-    # --- 模型选择 ---
+    # --- 模型选择：自动获取列表 + 手动填写兜底 ---
     if st.session_state.model_list:
-        selected_model = st.selectbox("选择模型", st.session_state.model_list)  # 下拉选模型
+        selected_model = st.selectbox("选择模型", st.session_state.model_list)   # 自动获取成功：下拉选
     else:
-        selected_model = st.text_input("手动输入模型名", "gpt-4o")   # 没拉列表时手动输
+        selected_model = st.text_input("手动输入模型名", "gpt-4o")   # 没拉到列表：手动填模型名
 
     # --- 初始化 agent ---
     if st.button("连接助手") and api_key:
@@ -532,13 +545,28 @@ with tab2:
                 st.write(user_input)   # 回显用户消息
 
             with st.chat_message("assistant"):
-                placeholder = st.empty()   # 占位框，逐 token 填充
-                full_response = ""
-                try:
-                    for chunk in st.session_state.agent.ask_stream(user_input):
-                        full_response += chunk   # 累加 token
-                        placeholder.markdown(full_response)   # 实时更新显示
-                except Exception as e:
-                    placeholder.error(f"出错了: {e}")
-                    full_response = f"[错误] {e}"
-                st.session_state.chat_history.append({"role": "assistant", "content": full_response})  # 保存回复
+                # 推理过程用浅灰小字折叠显示，正文实时更新
+                reasoning_placeholder = st.empty()   # 推理过程占位
+                placeholder = st.empty()             # 正文占位
+                full_response = ""                   # 完整回答
+                reasoning_text = ""                  # 推理过程
+                with st.status("思考中...", expanded=False) as status:   # 折叠状态框
+                    try:
+                        for kind, payload in st.session_state.agent.ask_stream(user_input):   # 遍历流式片段
+                            if kind == "reasoning":        # 推理过程片段
+                                reasoning_text += payload  # 累加推理文本
+                                status.update(label=f"🤔 思考中 {len(reasoning_text)} 字...", expanded=False)   # 更新字数提示
+                            elif kind == "content":        # 正文片段
+                                full_response += payload   # 累加正文
+                                placeholder.markdown(full_response)   # 实时更新显示
+                    except Exception as e:
+                        placeholder.error(f"出错了: {e}")   # 错误提示
+                        full_response = f"[错误] {e}"        # 记录错误到历史
+                    finally:
+                        status.update(label="✅ 回答完成", expanded=False)   # 完成后更新状态
+                if reasoning_text and full_response:   # 有推理和正文
+                    with st.expander("💭 思考过程"):   # 折叠显示思考过程
+                        st.write(reasoning_text)       # 显示推理全文
+                elif reasoning_text and not full_response:   # 只有推理没正文（异常情况）
+                    st.write(reasoning_text)   # 直接显示推理
+                st.session_state.chat_history.append({"role": "assistant", "content": full_response})   # 保存回复

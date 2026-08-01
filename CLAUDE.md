@@ -48,5 +48,5 @@ project (工区)
 
 ## 环境与运行
 
-- Python 依赖装在 PyCharm 的 conda 环境 `torch2`，本机系统 Python 没有 streamlit/pandas。
-- 运行：在 PyCharm 里以 `torch2` 解释器跑 `streamlit run app.py`。
+- Python 依赖装在  uv 环境/Users/pinganxilemac/uv_env/.venv/bin/python，本机系统 Python 没有 streamlit/pandas。
+- 运行：在 PyCharm 里以解释器跑 `streamlit run app.py`。
