@@ -85,30 +85,29 @@ with tab1:
         else:
             target_project_name = selected_option              # 否则直接用选中的工区名
         sp_files = st.file_uploader("1. 上传to_recorder (SPS)", type=['sps', 's', 'S01'], accept_multiple_files=True)  # 设计 SPS：支持多文件
-        # daily SPS 日期从文件名自动提取（格式 swxxxx-mmdd.sps），不再手动输入
+        # daily SPS 日期从文件名自动提取（格式 sw<线束号>-<mmdd>.sps，如 sw123-0731.sps）
+        target_year = st.selectbox("作业年份", list(range(2020, 2031)), index=datetime.date.today().year - 2020)  # 作业年份下拉
         daily_sps_file = st.file_uploader("2. 上传生产daily SPS", type=['sps', 's'], accept_multiple_files=True)  # daily SPS：支持多文件
-        # 日期逻辑：优先从文件名自动识别 mmdd，匹配不到则显示手动输入框
+        # 日期逻辑：从文件名提取 mmdd（格式 sw<线束号>-<MMDD>.sps）
         if daily_sps_file:
             file_list_for_date = daily_sps_file if isinstance(daily_sps_file, list) else [daily_sps_file]
             fname = file_list_for_date[0].name    # 取第一个文件名推断日期
-            m = re.search(r'(\d{4})', fname)      # 匹配连续 4 位数字 = mmdd（如 0731）
+            m = re.search(r'[-_](\d{2})(\d{2})\.\w+$', fname)  # 分隔符+月+日+扩展名 = 文件名后缀
             if m:
-                mmdd = m.group(1)                  # 提取 mmdd = 月月日日，如 "0731"
-                month = int(mmdd[:2])              # 前两位 = 月（07）
-                day = int(mmdd[2:])                # 后两位 = 日（31）
-                year = datetime.date.today().year  # 默认今年
+                mm = int(m.group(1))               # 月（07）
+                dd = int(m.group(2))               # 日（31）
                 try:
-                    auto_date = datetime.date(year, month, day)  # 组装日期对象
-                    st.info(f"自动识别日期: {auto_date}（文件名: {fname}）")  # 提示识别结果
+                    auto_date = datetime.date(target_year, mm, dd)  # 组装日期，用下拉选的年份
+                    st.info(f"📅 自动识别日期: {auto_date}（文件名: {fname}）")  # 提示识别结果
                     target_date = auto_date         # 用自动识别的日期
                 except ValueError:
-                    st.warning(f"文件名日期 {mmdd} 不合法，请手动选择")  # 日期越界时兜底
-                    target_date = st.date_input("选择作业日期", datetime.date.today())
+                    st.warning(f"文件名 {fname} 的日期 {mm:02d}{dd:02d} 不合法")  # 日期越界时提示
+                    target_date = None
             else:
-                st.info("未从文件名识别到日期格式 (swxxxx-MMDD.sps)，请手动选择")
-                target_date = st.date_input("选择作业日期", datetime.date.today())
+                st.warning(f"未识别到日期后缀 → {fname}，请确认文件名格式为 sw*_MMDD.sps")  # 匹配失败时提示
+                target_date = None
         else:
-            target_date = st.date_input("选择作业日期", datetime.date.today())  # 未上传文件时手动选择
+            target_date = None   # 未上传文件时无日期，入库时会跳过 daily SPS
         st.markdown("---")   # 分隔线
         save_btn = st.button("💾 确认入库")  # 确认入库按钮，点下才写数据库
 
@@ -206,60 +205,67 @@ with tab1:
                 st.sidebar.error(f"设计sps数据入库错误: {e}")  # 出错则提示错误信息
 
         if daily_sps is not None and not daily_sps.empty:
-            try:
-                # 覆盖式导入：先删该工区该日期的生产记录，再入库
-                c.execute("""
-                          DELETE FROM shot_attempt
-                          WHERE work_day_id IN (
-                              SELECT id FROM work_day WHERE project_id = ? AND work_date = ?
-                          )
-                          """, (project_id, target_date))   # 删掉同工区同日期旧数据，实现重新导入=覆盖
-                # 确保 work_day 存在
-                c.execute("INSERT OR IGNORE INTO work_day (project_id, work_date) VALUES (?, ?)",
-                          (project_id, target_date))        # 该日期不存在则插入，存在则忽略
-                conn.commit()
-                wd_id = c.execute("SELECT id FROM work_day WHERE project_id = ? AND work_date = ?",
-                                  (project_id, target_date)).fetchone()[0]  # 拿到 work_day 的 id
+            if target_date is None:
+                st.sidebar.warning("daily SPS 无法入库：未能从文件名识别到日期")  # target_date=None 时跳过
+            else:
 
-                rows = []         # 准备写入的生产记录列表
-                skip_swath = 0    # 记录 swath 不匹配但 (line,point) 匹配的炮数
-                for _, row in daily_sps.iterrows():
-                    if row.get('Swath'):
-                        dp = c.execute("""
-                                       SELECT id FROM design_point
-                                       WHERE project_id = ? AND line = ? AND point = ? AND swath = ?
-                                       """, (project_id, row['Line'], row['Point'], row['Swath'])).fetchone()  # 优先按 (line,point,swath) 匹配
-                        if dp is None:
-                            # 退而求其次：该工区确实有这个设计点，只是 swath 标注不一致
-                            alt = c.execute("""
-                                            SELECT id FROM design_point
-                                            WHERE project_id = ? AND line = ? AND point = ?
-                                            """, (project_id, row['Line'], row['Point'])).fetchone()  # 退回按 (line,point) 匹配
-                            if alt is not None:
-                                skip_swath += 1   # 记录一次 swath 不一致
-                        dp = dp or alt            # 优先用 swath 匹配结果，否则用退回结果
-                    else:
-                        dp = c.execute("""
-                                       SELECT id FROM design_point
-                                       WHERE project_id = ? AND line = ? AND point = ?
-                                       """, (project_id, row['Line'], row['Point'])).fetchone()  # 没 swath 直接按 (line,point) 匹配
-                    if dp is None:
-                        continue   # 匹配不到设计点，跳过这一炮
-                    rows.append((wd_id, dp[0], row['Elevation'], row['GPS Time'], row.get('Swath')))  # 组装入库元组
+                    try:
+                        # 覆盖式导入：先删该工区该日期的生产记录，再入库
+        c.execute("""
+                                      DELETE FROM shot_attempt
+                                      WHERE work_day_id IN (
+                                          SELECT id FROM work_day WHERE project_id = ? AND work_date = ?
+                                      )
+                                      """, (project_id, target_date))   # 删掉同工区同日期旧数据，实现重新导入=覆盖
+                        # 确保 work_day 存在
+        c.execute("INSERT OR IGNORE INTO work_day (project_id, work_date) VALUES (?, ?)",
+                                  (project_id, target_date))        # 该日期不存在则插入，存在则忽略
+                        conn.commit()
+                        wd_id = c.execute("SELECT id FROM work_day WHERE project_id = ? AND work_date = ?",
+                                          (project_id, target_date)).fetchone()[0]  # 拿到 work_day 的 id
 
-                if rows:
-                    c.executemany("""
-                                  INSERT INTO shot_attempt (work_day_id, design_point_id, elevation, gps_time, swath)
-                                  VALUES (?, ?, ?, ?, ?)
-                                  """, rows)       # 批量写入生产记录
-                    conn.commit()
-                    msg = f"✅ {target_date} 的数据已入库！匹配 {len(rows)} 个设计点"  # 成功提示
-                    if skip_swath:
-                        msg += f"（{skip_swath} 炮 swath 标注不一致，已按设计点归属）"  # 附上 swath 不一致数
-                    st.sidebar.success(msg)
-                else:
-                    st.sidebar.warning("没有匹配到设计点的生产记录")  # 一条都没匹配上
-            except Exception as e:
+                        rows = []         # 准备写入的生产记录列表
+                        skip_swath = 0    # 记录 swath 不匹配但 (line,point) 匹配的炮数
+                        for _, row in daily_sps.iterrows():
+                            if row.get('Swath'):
+                                dp = c.execute("""
+                                               SELECT id FROM design_point
+                                               WHERE project_id = ? AND line = ? AND point = ? AND swath = ?
+                                               """, (project_id, row['Line'], row['Point'], row['Swath'])).fetchone()  # 优先按 (line,point,swath) 匹配
+                                if dp is None:
+                                    # 退而求其次：该工区确实有这个设计点，只是 swath 标注不一致
+                                    alt = c.execute("""
+                                                    SELECT id FROM design_point
+                                                    WHERE project_id = ? AND line = ? AND point = ?
+                                                    """, (project_id, row['Line'], row['Point'])).fetchone()  # 退回按 (line,point) 匹配
+                                    if alt is not None:
+                                        skip_swath += 1   # 记录一次 swath 不一致
+                                dp = dp or alt            # 优先用 swath 匹配结果，否则用退回结果
+                            else:
+                                dp = c.execute("""
+                                               SELECT id FROM design_point
+                                               WHERE project_id = ? AND line = ? AND point = ?
+                                               """, (project_id, row['Line'], row['Point'])).fetchone()  # 没 swath 直接按 (line,point) 匹配
+                            if dp is None:
+                                continue   # 匹配不到设计点，跳过这一炮
+                            rows.append((wd_id, dp[0], row['Elevation'], row['GPS Time'], row.get('Swath')))  # 组装入库元组
+
+                        if rows:
+                            c.executemany("""
+                                          INSERT INTO shot_attempt (work_day_id, design_point_id, elevation, gps_time, swath)
+                                          VALUES (?, ?, ?, ?, ?)
+                                          """, rows)       # 批量写入生产记录
+                            conn.commit()
+                            msg = f"✅ {target_date} 的 daily SPS 已入库！匹配 {len(rows)} 炮"  # 成功提示
+                            if daily_parts:
+                                fnames = ", ".join(p.name for p in file_list_daily) if file_list_daily else ""
+                                msg += f"\n📁 文件: {fnames}"  # 附上文件名，方便确认
+                            if skip_swath:
+                                msg += f"（{skip_swath} 炮 swath 标注不一致，已按设计点归属）"  # 附上 swath 不一致数
+                            st.sidebar.success(msg)
+                        else:
+                            st.sidebar.warning("没有匹配到设计点的生产记录")  # 一条都没匹配上
+                    except Exception as e:
                 st.sidebar.error(f"daily sps入库失败: {e}")  # 入库过程出错
 
     # 画图
