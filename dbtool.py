@@ -12,6 +12,8 @@ from langchain.agents.middleware import ModelRequest, ModelResponse   # LangChai
 from langchain.tools import tool            # LangChain：把函数包装成工具
 from langchain_openai import ChatOpenAI     # LangChain：OpenAI 兼容接口的模型客户端
 from langchain_core.messages import AIMessage, HumanMessage   # LangChain：消息类型
+from langgraph.checkpoint.sqlite import SqliteSaver   # LangGraph：会话记忆持久化到 SQLite 文件
+import sqlite3 as _sqlite3   # sqlite3：创建记忆存储的连接
 
 
 class _StreamMiddleware(AgentMiddleware):
@@ -135,15 +137,19 @@ class _StreamMiddleware(AgentMiddleware):
 
 
 class Productiontool:
-    """S90 生产数据助手：LangChain 智能体 + 数据库工具 + 推理过程可见的流式输出"""
+    """S90 生产数据助手：LangChain 智能体 + 数据库工具 + 推理过程可见的流式输出 + 会话记忆"""
 
-    def __init__(self, db_path: str, api_key: str, model_name: str, base_url: str):
-        """初始化：模型客户端、工具、智能体"""
-        self.db_path = db_path   # 数据库文件路径
+    def __init__(self, db_path: str, api_key: str, model_name: str, base_url: str,
+                 memory_db: str = "agent_memory.db"):
+        """初始化：模型客户端、工具、智能体（带持久化会话记忆）"""
+        self.db_path = db_path   # 生产数据库文件路径
         self.llm = ChatOpenAI(model=model_name,   # 指定模型名
                               base_url=base_url,  # 接口地址，如 https://xxx/v1
                               api_key=api_key,    # API 密钥
                               temperature=0)      # 生产分析场景设为 0，回答稳定
+        # 会话记忆：SQLite 文件持久化，同 thread_id 的多轮对话共享上下文
+        self._memory_conn = _sqlite3.connect(memory_db, check_same_thread=False)   # 记忆库连接（后台线程也要用，关闭线程检查）
+        self.checkpointer = SqliteSaver(self._memory_conn)   # 记忆检查点：按 thread_id 存取对话历史
         self.tools = self._setup_tools()   # 准备工具列表
         self._stream_queue = queue.Queue()   # 流式片段队列（线程间传递）
         self.agent = create_agent(         # 用 LangChain 组装智能体
@@ -151,7 +157,16 @@ class Productiontool:
             tools=self.tools,              # 可用工具
             system_prompt=self._make_prompt(),   # 系统提示词
             middleware=[_StreamMiddleware(self._stream_queue, self.llm)],   # 挂载流式中间件
+            checkpointer=self.checkpointer,   # 挂载记忆检查点：invoke 时按 thread_id 自动读写对话历史
         )
+
+    def get_threads(self):
+        """列出所有记忆会话的 thread_id（供界面做会话切换）"""
+        return list(self.checkpointer.list(None))   # 返回所有检查点元数据
+
+    def delete_thread(self, thread_id: str):
+        """删除某会话的全部记忆（thread_id 对应的检查点链）"""
+        self.checkpointer.delete_thread(thread_id)   # 删除该会话所有检查点
 
     def _get_conn(self):
         """建立数据库连接，开启外键约束"""
@@ -271,8 +286,8 @@ class Productiontool:
 - 回答用简体中文
 """
 
-    def ask_stream(self, query: str):
-        """流式问答生成器：先流式输出推理过程，再逐 token 输出回答"""
+    def ask_stream(self, query: str, thread_id: str = "default"):
+        """流式问答生成器：先流式输出推理过程，再逐 token 输出回答（带会话记忆）"""
         # 清空队列，确保本轮的片段干净
         while not self._stream_queue.empty():
             self._stream_queue.get_nowait()
@@ -280,7 +295,11 @@ class Productiontool:
         # 后台线程执行 agent（工具调用 + 模型调用都在里面）
         def run_agent():
             try:
-                self.agent.invoke({"messages": [HumanMessage(content=query)]})   # 执行智能体
+                # config 里的 thread_id 决定记忆会话：同一 thread_id 多轮对话共享上下文
+                self.agent.invoke(
+                    {"messages": [HumanMessage(content=query)]},
+                    config={"configurable": {"thread_id": thread_id}},   # 指定会话 ID，按此读写记忆
+                )   # 执行智能体
             except Exception as e:
                 self._stream_queue.put(("error", str(e)))   # 异常也放进队列
             finally:

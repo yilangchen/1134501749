@@ -60,6 +60,13 @@ CREATE INDEX IF NOT EXISTS idx_design_point_lp    ON design_point (line, point);
 CREATE INDEX IF NOT EXISTS idx_work_day_proj_date ON work_day (project_id, work_date);        -- 按工区日期查作业日用
 CREATE INDEX IF NOT EXISTS idx_shot_attempt_workday ON shot_attempt (work_day_id);            -- 按作业日查生产记录用
 CREATE INDEX IF NOT EXISTS idx_shot_attempt_designpt ON shot_attempt (design_point_id);       -- 按设计点查生产记录用
+
+CREATE TABLE IF NOT EXISTS agent_session (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,   -- 主键自增
+    name       TEXT NOT NULL UNIQUE,                -- 会话显示名（唯一，如 "会话 20260801-1430"）
+    thread_id  TEXT NOT NULL UNIQUE,                -- 对应 LangGraph 记忆的 thread_id
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP   -- 创建时间
+);
 """)
 conn.commit()  # 提交建表事务，表结构立即生效
 # --- 1. 页面基本配置 (UI设置) ---
@@ -88,26 +95,7 @@ with tab1:
         # daily SPS 日期从文件名自动提取（格式 sw<线束号>-<mmdd>.sps，如 sw123-0731.sps）
         target_year = st.selectbox("作业年份", list(range(2020, 2031)), index=datetime.date.today().year - 2020)  # 作业年份下拉
         daily_sps_file = st.file_uploader("2. 上传生产daily SPS", type=['sps', 's'], accept_multiple_files=True)  # daily SPS：支持多文件
-        # 日期逻辑：从文件名提取 mmdd（格式 sw<线束号>-<MMDD>.sps）
-        if daily_sps_file:
-            file_list_for_date = daily_sps_file if isinstance(daily_sps_file, list) else [daily_sps_file]
-            fname = file_list_for_date[0].name    # 取第一个文件名推断日期
-            m = re.search(r'[-_](\d{2})(\d{2})\.\w+$', fname)  # 分隔符+月+日+扩展名 = 文件名后缀
-            if m:
-                mm = int(m.group(1))               # 月（07）
-                dd = int(m.group(2))               # 日（31）
-                try:
-                    auto_date = datetime.date(target_year, mm, dd)  # 组装日期，用下拉选的年份
-                    st.info(f"📅 自动识别日期: {auto_date}（文件名: {fname}）")  # 提示识别结果
-                    target_date = auto_date         # 用自动识别的日期
-                except ValueError:
-                    st.warning(f"文件名 {fname} 的日期 {mm:02d}{dd:02d} 不合法")  # 日期越界时提示
-                    target_date = None
-            else:
-                st.warning(f"未识别到日期后缀 → {fname}，请确认文件名格式为 sw*_MMDD.sps")  # 匹配失败时提示
-                target_date = None
-        else:
-            target_date = None   # 未上传文件时无日期，入库时会跳过 daily SPS
+        # 日期逻辑：每个 daily 文件的日期在读取阶段已从文件名提取（见下方 file_date_map）
         st.markdown("---")   # 分隔线
         save_btn = st.button("💾 确认入库")  # 确认入库按钮，点下才写数据库
 
@@ -171,10 +159,29 @@ with tab1:
             df['Swath'] = extract_swath(f.name)               # 从文件名提取 swath 号
             return df
 
-        daily_parts = []                                      # 暂存每个 daily 文件的 DataFrame
-        for f in file_list_daily:                              # 遍历每个 daily 文件
-            daily_parts.append(read_daily_file(f))            # 解析单个 daily 文件
+        daily_parts = []             # 暂存每个 daily 文件的 DataFrame
+        file_date_map = {}           # 文件名 -> 日期：记录每个文件对应的日期
+        for f in file_list_daily:    # 遍历每个 daily 文件
+            df_f = read_daily_file(f)            # 解析单个 daily 文件
+            df_f['_src_file'] = f.name           # 标记数据来源文件名，入库时按文件分组
+            daily_parts.append(df_f)             # 收进列表
+            m = re.search(r'[-_](\d{2})(\d{2})\.\w+$', f.name)  # 从文件名提取 mmdd
+            if m:
+                mm = int(m.group(1))             # 月
+                dd = int(m.group(2))             # 日
+                try:
+                    file_date_map[f.name] = datetime.date(target_year, mm, dd)  # 组装日期，用下拉选的年份
+                except ValueError:
+                    file_date_map[f.name] = None  # 日期不合法记为 None
+            else:
+                file_date_map[f.name] = None      # 匹配不到记为 None
         daily_sps = pd.concat(daily_parts, ignore_index=True) if daily_parts else pd.DataFrame()  # 合并所有 daily 文件
+        # 侧边栏展示识别到的日期
+        for fn, dt in file_date_map.items():
+            if dt:
+                st.caption(f"📅 {fn} → {dt}")     # 提示每个文件的识别日期
+            else:
+                st.warning(f"⚠ {fn} 未识别到日期，将跳过")  # 提示未识别的文件
 
     # 数据确定入库
     if save_btn:
@@ -190,89 +197,97 @@ with tab1:
                               INSERT INTO design_point (project_id, line, point, x, y, batch_src, swath)
                               VALUES (?, ?, ?, ?, ?, ?, ?)
                               ON CONFLICT (project_id, line, point) DO UPDATE SET
-                                  x = excluded.x,                                            # 冲突时更新坐标
+                                  x = excluded.x,                                            -- 冲突时更新坐标
                                   y = excluded.y,
-                                  swath = COALESCE(excluded.swath, design_point.swath),      # 已有 swath 不覆盖
-                                  batch_src = CASE                                           # 追加批次标签
-                                      WHEN design_point.batch_src IS NULL OR design_point.batch_src = '' THEN excluded.batch_src   # 原为空直接用
-                                      WHEN instr(',' || design_point.batch_src || ',', ',' || excluded.batch_src || ',') > 0 THEN design_point.batch_src  # 已含该批次则不动
-                                      ELSE design_point.batch_src || ',' || excluded.batch_src   # 否则逗号追加
+                                  swath = COALESCE(excluded.swath, design_point.swath),      -- 已有 swath 不覆盖
+                                  batch_src = CASE                                           -- 追加批次标签
+                                      WHEN design_point.batch_src IS NULL OR design_point.batch_src = '' THEN excluded.batch_src   -- 原为空直接用
+                                      WHEN instr(',' || design_point.batch_src || ',', ',' || excluded.batch_src || ',') > 0 THEN design_point.batch_src  -- 已含该批次则不动
+                                      ELSE design_point.batch_src || ',' || excluded.batch_src   -- 否则逗号追加
                                   END
                               """, params)
                 conn.commit()  # 提交设计点写入
                 st.sidebar.success(f"上传并存储 {len(df_sp)} 个设计点")  # 侧边栏提示成功
+                load_all_designs.clear()   # 清绘图缓存，新设计点立即生效
             except sqlite3.Error as e:
                 st.sidebar.error(f"设计sps数据入库错误: {e}")  # 出错则提示错误信息
 
         if daily_sps is not None and not daily_sps.empty:
-            if target_date is None:
-                st.sidebar.warning("daily SPS 无法入库：未能从文件名识别到日期")  # target_date=None 时跳过
-            else:
+            # 按日期分组：每个日期一组独立入库（覆盖式），实现多文件多天一起导入
+            date_groups = {}   # 日期 -> 该日期的数据行
+            for _, row in daily_sps.iterrows():
+                dt = file_date_map.get(row['_src_file'])   # 取该行来源文件的日期
+                if dt is None:
+                    continue   # 日期未识别的文件整组跳过
+                date_groups.setdefault(dt, []).append(row)   # 按日期归组
+            if not date_groups:
+                st.sidebar.warning("daily SPS 无法入库：未能从文件名识别到日期")  # 全部无法识别时提示
+            for target_date, day_rows in date_groups.items():
+                try:
+                    # 覆盖式导入：先删该工区该日期的作业记录，再入库
+                    c.execute("""
+                              DELETE FROM shot_attempt
+                              WHERE work_day_id IN (
+                                  SELECT id FROM work_day WHERE project_id = ? AND work_date = ?
+                              )
+                              """, (project_id, target_date))   # 删掉同工区同日期旧数据，实现重新导入=覆盖
+                    # 确保 work_day 存在
+                    c.execute("INSERT OR IGNORE INTO work_day (project_id, work_date) VALUES (?, ?)",
+                              (project_id, target_date))        # 该日期不存在则插入，存在则忽略
+                    conn.commit()
+                    wd_id = c.execute("SELECT id FROM work_day WHERE project_id = ? AND work_date = ?",
+                                      (project_id, target_date)).fetchone()[0]  # 拿到 work_day 的 id
 
-                    try:
-                        # 覆盖式导入：先删该工区该日期的生产记录，再入库
-        c.execute("""
-                                      DELETE FROM shot_attempt
-                                      WHERE work_day_id IN (
-                                          SELECT id FROM work_day WHERE project_id = ? AND work_date = ?
-                                      )
-                                      """, (project_id, target_date))   # 删掉同工区同日期旧数据，实现重新导入=覆盖
-                        # 确保 work_day 存在
-        c.execute("INSERT OR IGNORE INTO work_day (project_id, work_date) VALUES (?, ?)",
-                                  (project_id, target_date))        # 该日期不存在则插入，存在则忽略
-                        conn.commit()
-                        wd_id = c.execute("SELECT id FROM work_day WHERE project_id = ? AND work_date = ?",
-                                          (project_id, target_date)).fetchone()[0]  # 拿到 work_day 的 id
-
-                        rows = []         # 准备写入的生产记录列表
-                        skip_swath = 0    # 记录 swath 不匹配但 (line,point) 匹配的炮数
-                        for _, row in daily_sps.iterrows():
-                            if row.get('Swath'):
-                                dp = c.execute("""
-                                               SELECT id FROM design_point
-                                               WHERE project_id = ? AND line = ? AND point = ? AND swath = ?
-                                               """, (project_id, row['Line'], row['Point'], row['Swath'])).fetchone()  # 优先按 (line,point,swath) 匹配
-                                if dp is None:
-                                    # 退而求其次：该工区确实有这个设计点，只是 swath 标注不一致
-                                    alt = c.execute("""
-                                                    SELECT id FROM design_point
-                                                    WHERE project_id = ? AND line = ? AND point = ?
-                                                    """, (project_id, row['Line'], row['Point'])).fetchone()  # 退回按 (line,point) 匹配
-                                    if alt is not None:
-                                        skip_swath += 1   # 记录一次 swath 不一致
-                                dp = dp or alt            # 优先用 swath 匹配结果，否则用退回结果
-                            else:
-                                dp = c.execute("""
-                                               SELECT id FROM design_point
-                                               WHERE project_id = ? AND line = ? AND point = ?
-                                               """, (project_id, row['Line'], row['Point'])).fetchone()  # 没 swath 直接按 (line,point) 匹配
+                    rows = []         # 准备写入的生产记录列表
+                    skip_swath = 0    # 记录 swath 不匹配但 (line,point) 匹配的炮数
+                    for row in day_rows:
+                        if row.get('Swath'):
+                            dp = c.execute("""
+                                           SELECT id FROM design_point
+                                           WHERE project_id = ? AND line = ? AND point = ? AND swath = ?
+                                           """, (project_id, row['Line'], row['Point'], row['Swath'])).fetchone()  # 优先按 (line,point,swath) 匹配
                             if dp is None:
-                                continue   # 匹配不到设计点，跳过这一炮
-                            rows.append((wd_id, dp[0], row['Elevation'], row['GPS Time'], row.get('Swath')))  # 组装入库元组
-
-                        if rows:
-                            c.executemany("""
-                                          INSERT INTO shot_attempt (work_day_id, design_point_id, elevation, gps_time, swath)
-                                          VALUES (?, ?, ?, ?, ?)
-                                          """, rows)       # 批量写入生产记录
-                            conn.commit()
-                            msg = f"✅ {target_date} 的 daily SPS 已入库！匹配 {len(rows)} 炮"  # 成功提示
-                            if daily_parts:
-                                fnames = ", ".join(p.name for p in file_list_daily) if file_list_daily else ""
-                                msg += f"\n📁 文件: {fnames}"  # 附上文件名，方便确认
-                            if skip_swath:
-                                msg += f"（{skip_swath} 炮 swath 标注不一致，已按设计点归属）"  # 附上 swath 不一致数
-                            st.sidebar.success(msg)
+                                # 退而求其次：该工区确实有这个设计点，只是 swath 标注不一致
+                                alt = c.execute("""
+                                                SELECT id FROM design_point
+                                                WHERE project_id = ? AND line = ? AND point = ?
+                                                """, (project_id, row['Line'], row['Point'])).fetchone()  # 退回按 (line,point) 匹配
+                                if alt is not None:
+                                    skip_swath += 1   # 记录一次 swath 不一致
+                            dp = dp or alt            # 优先用 swath 匹配结果，否则用退回结果
                         else:
-                            st.sidebar.warning("没有匹配到设计点的生产记录")  # 一条都没匹配上
-                    except Exception as e:
-                st.sidebar.error(f"daily sps入库失败: {e}")  # 入库过程出错
+                            dp = c.execute("""
+                                           SELECT id FROM design_point
+                                           WHERE project_id = ? AND line = ? AND point = ?
+                                           """, (project_id, row['Line'], row['Point'])).fetchone()  # 没 swath 直接按 (line,point) 匹配
+                        if dp is None:
+                            continue   # 匹配不到设计点，跳过这一炮
+                        rows.append((wd_id, dp[0], row['Elevation'], row['GPS Time'], row.get('Swath')))  # 组装入库元组
+
+                    if rows:
+                        c.executemany("""
+                                      INSERT INTO shot_attempt (work_day_id, design_point_id, elevation, gps_time, swath)
+                                      VALUES (?, ?, ?, ?, ?)
+                                      """, rows)       # 批量写入生产记录
+                        conn.commit()
+                        fnames = ", ".join(sorted({row['_src_file'] for row in day_rows}))  # 该日期的来源文件名
+                        msg = f"✅ {target_date} 的 daily SPS 已入库！匹配 {len(rows)} 炮"  # 成功提示
+                        if fnames:
+                            msg += f"\n📁 文件: {fnames}"  # 附上文件名，方便核对
+                        if skip_swath:
+                            msg += f"（{skip_swath} 炮 swath 标注不一致，已按设计点归属）"  # 附上 swath 不一致数
+                        st.sidebar.success(msg)
+                    else:
+                        st.sidebar.warning(f"{target_date} 没有匹配到设计点的生产记录")  # 一条都没匹配上
+                    load_daily_sps.clear()   # 清绘图缓存，新生产点立即生效
+                except Exception as e:
+                    st.sidebar.error(f"daily sps入库失败: {e}")  # 入库过程出错
 
     # 画图
     with col_chart:
         quick_mode = st.checkbox("⚡ 快速模式（降采样，点太多时推荐）", value=False)  # 快速模式：最多画 2 万点 — 整行放置，全局模式
-        # 5 列等宽对齐：工区 | 开始日期 | 结束日期 | swath 筛选 | Plot 按钮
-        subcol_1, subcol_2, subcol_3, subcol_4, subcol_5 = st.columns([1, 1, 1, 1, 1])  # 统一放在同一行
+        # 第一行：工区 | 开始日期 | 结束日期 | Plot 按钮（swath 筛选单独放下一行）
+        subcol_1, subcol_2, subcol_3, subcol_4 = st.columns([1, 1, 1, 1])  # 4 列等宽对齐
         with subcol_1:
             plot_project_options = project_list if project_list else ["工区1"]  # 绘图工区下拉选项
             selected_project = st.selectbox("绘图工区", plot_project_options)     # 选择要画哪个工区
@@ -281,40 +296,26 @@ with tab1:
         with subcol_3:
             selected_pro2 = st.date_input("结束日期")   # 生产数据的结束日期
         with subcol_4:
-            # 该工区已有的 swath 列表（供筛选）
-            try:
-                swath_df = pd.read_sql("""
-                                       SELECT DISTINCT swath FROM design_point dp
-                                       JOIN project p ON p.id = dp.project_id
-                                       WHERE p.name = ? AND dp.swath IS NOT NULL AND dp.swath <> ''
-                                       ORDER BY dp.swath
-                                       """, conn, params=(selected_project,))  # 查该工区所有 swath 号
-                swath_list = swath_df["swath"].tolist()
-            except:
-                swath_list = []
-            selected_swaths = st.multiselect("swath 筛选（留空=全部）", swath_list, default=swath_list)  # 默认全选所有束线，用户可手动取消某些束线
-        with subcol_5:
-            plot_clicked = st.button("Plot", use_container_width=True)   # Plot 按钮，宽填满第 5 列，与上面控件底部对齐
+            plot_clicked = st.button("Plot", use_container_width=True)   # Plot 按钮，宽填满第 4 列
+        # swath 筛选：单独一行占满整行，留空 = 全部束线
+        try:
+            swath_df = pd.read_sql("""
+                                   SELECT DISTINCT swath FROM design_point dp
+                                   JOIN project p ON p.id = dp.project_id
+                                   WHERE p.name = ? AND dp.swath IS NOT NULL AND dp.swath <> ''
+                                   ORDER BY dp.swath
+                                   """, conn, params=(selected_project,))  # 查该工区所有 swath 号
+            swath_list = swath_df["swath"].tolist()
+        except:
+            swath_list = []
+        selected_swaths = st.multiselect("swath 筛选（不选 = 全部）", options=swath_list,
+                                         placeholder="全部束线")  # 整行多选，默认空 = 不过滤，标签横向排列不换行
 
         if plot_clicked:   # 点 Plot 按钮才画图
 
             @st.cache_data
-            def load_all_designs(project_name, swaths=()):
-                if not project_name:
-                    return pd.DataFrame()
-                if swaths:
-                    placeholders = ', '.join(['?'] * len(swaths))   # 生成 "?,?,?" 占位符
-                    query = f"""
-                            SELECT dp.line  as Line,
-                                   dp.point as Point,
-                                   dp.x     as X,
-                                   dp.y     as Y
-                            FROM design_point dp
-                            JOIN project p ON p.id = dp.project_id
-                            WHERE p.name = ? AND dp.swath IN ({placeholders})   -- 按 swath 筛选设计点
-                            ORDER BY dp.line, dp.point
-                            """
-                    return pd.read_sql(query, conn, params=[project_name] + list(swaths))
+            def load_all_designs(project_name):
+                # 设计点与时间、swath 均无关：始终查全量，不按 swath 过滤
                 query = """
                         SELECT dp.line  as Line,
                                dp.point as Point,
@@ -324,10 +325,10 @@ with tab1:
                         JOIN project p ON p.id = dp.project_id
                         WHERE p.name = ?
                         ORDER BY dp.line, dp.point
-                        """   # 不筛选 swath，查全部设计点
+                        """
                 return pd.read_sql(query, conn, params=(project_name,))
 
-            df_design = load_all_designs(selected_project, tuple(selected_swaths))  # 加载设计点
+            df_design = load_all_designs(selected_project)  # 加载全部设计点
 
             @st.cache_data
             def load_daily_sps(project_name, start_date, end_date, swaths=()):
@@ -339,13 +340,14 @@ with tab1:
                                    dp.x         as X,
                                    dp.y         as Y,
                                    sa.elevation as Elevation,
+                                   sa.swath     as Swath,
                                    wd.work_date
                             FROM shot_attempt sa
                             JOIN design_point dp ON dp.id = sa.design_point_id
                             JOIN work_day wd ON wd.id = sa.work_day_id
                             JOIN project p ON p.id = wd.project_id
                             WHERE p.name = ? AND wd.work_date BETWEEN ? AND ?
-                              AND dp.swath IN ({placeholders})   -- 按 swath 筛选生产点
+                              AND sa.swath IN ({placeholders})   -- 按生产记录的 swath 筛选
                             ORDER BY wd.work_date, dp.line, dp.point
                             """
                     return pd.read_sql(query, conn,
@@ -356,6 +358,7 @@ with tab1:
                                dp.x         as X,
                                dp.y         as Y,
                                sa.elevation as Elevation,
+                               sa.swath     as Swath,
                                wd.work_date
                         FROM shot_attempt sa
                         JOIN design_point dp ON dp.id = sa.design_point_id
@@ -379,7 +382,7 @@ with tab1:
                 fig = Tool.add_production_sps(fig, df_daily, max_shown=max_shown)  # 叠加生产层（按高程上色）
             st.plotly_chart(fig)   # 渲染图表
 
-            st.session_state.df_design = load_all_designs(selected_project, tuple(selected_swaths))   # 存设计点供统计
+            st.session_state.df_design = load_all_designs(selected_project)   # 存设计点供统计
             st.session_state.df_daily = load_daily_sps(selected_project, selected_pro1, selected_pro2, tuple(selected_swaths))  # 存生产点供统计
 
     with col_stats:
@@ -469,6 +472,80 @@ with tab2:
         st.session_state.agent = None        # 当前 agent 实例，配置后才有
     if "model_list" not in st.session_state:
         st.session_state.model_list = []     # 可用模型列表
+    if "current_thread_id" not in st.session_state:
+        st.session_state.current_thread_id = None   # 当前会话的 thread_id（记忆键）
+    if "session_name" not in st.session_state:
+        st.session_state.session_name = None        # 当前会话显示名
+    if "last_models_fetched" not in st.session_state:
+        st.session_state.last_models_fetched = False   # 模型列表是否已自动拉取过
+
+    # --- 会话管理：列出 agent_session 表中的会话 ---
+    def load_sessions():
+        """读 agent_session 表，返回 [(id, name, thread_id), ...]"""
+        try:
+            return pd.read_sql("SELECT id, name, thread_id FROM agent_session ORDER BY id DESC",
+                               conn).to_dict("records")   # 按创建倒序，新的在前
+        except Exception:
+            return []   # 表不存在时返回空
+
+    def make_new_session():
+        """新建一个会话：插入 agent_session 表，返回 (name, thread_id)"""
+        name = f"会话 {datetime.datetime.now():%m%d-%H%M}"   # 显示名：会话 + 月日时分
+        thread_id = f"thread_{datetime.datetime.now():%Y%m%d%H%M%S}"   # 记忆键：thread_时间戳，避免重复
+        c.execute("INSERT INTO agent_session (name, thread_id) VALUES (?, ?)", (name, thread_id))
+        conn.commit()   # 提交插入
+        return name, thread_id   # 返回新会话标识
+
+    sessions = load_sessions()   # 当前会话列表
+    if not sessions and st.session_state.agent:   # 表空但有 agent：自动补建一个默认会话
+        n, t = make_new_session()                 # 建默认会话
+        sessions = load_sessions()                # 重读列表
+        st.session_state.current_thread_id = t    # 设为当前会话
+        st.session_state.session_name = n
+
+    # --- 会话切换区（放在配置区上方） ---
+    if st.session_state.agent and sessions:
+        session_options = {s["name"]: s for s in sessions}   # 显示名 -> 会话记录
+        picked = st.selectbox("记忆会话", list(session_options.keys()),
+                              index=max(0, [s["name"] for s in sessions].index(st.session_state.session_name)) if st.session_state.session_name in [s["name"] for s in sessions] else 0,
+                              key="session_select")   # 会话下拉：当前会话置顶显示
+        col_new, col_del = st.columns([1, 1])   # 新建/删除按钮两列
+        with col_new:
+            if st.button("➕ 新建会话", use_container_width=True):
+                n, t = make_new_session()            # 新建会话
+                st.session_state.current_thread_id = t   # 切换过去
+                st.session_state.session_name = n
+                st.session_state.chat_history = []   # 清空界面历史（新会话没历史）
+                st.rerun()                            # 刷新界面
+        with col_del:
+            if st.button("🗑 删除当前会话", use_container_width=True):
+                cur = session_options.get(st.session_state.session_name)   # 当前会话记录
+                if cur:
+                    st.session_state.agent.delete_thread(cur["thread_id"])   # 删记忆库里的检查点
+                    c.execute("DELETE FROM agent_session WHERE id = ?", (cur["id"],))   # 删会话记录
+                    conn.commit()
+                    st.session_state.chat_history = []   # 清空界面历史
+                    st.session_state.current_thread_id = None   # 无当前会话
+                    st.session_state.session_name = None
+                    st.rerun()                            # 刷新界面
+        # 下拉里手动切换会话：同步当前 thread_id 并恢复该会话历史
+        sel = session_options.get(picked)
+        if sel and sel["thread_id"] != st.session_state.current_thread_id:
+            st.session_state.current_thread_id = sel["thread_id"]   # 切到所选会话
+            st.session_state.session_name = sel["name"]
+            st.session_state.chat_history = []   # 先清空，下面从记忆恢复
+            try:
+                state = st.session_state.agent.agent.get_state(
+                    {"configurable": {"thread_id": sel["thread_id"]}})   # 读该会话的记忆
+                msgs = (state.values.get("messages") or []) if state else []   # 取消息列表
+                for m in msgs:   # 遍历消息
+                    if getattr(m, "type", "") in ("human", "ai"):   # 只显示人/助手的
+                        role = "user" if m.type == "human" else "assistant"   # 角色映射
+                        if m.content:   # 有内容才显示
+                            st.session_state.chat_history.append({"role": role, "content": m.content})   # 恢复一条
+            except Exception:
+                pass   # 恢复失败不阻塞，就当新会话
+        st.divider()   # 分隔线
 
     # --- 配置区：base_url + api_key → 拉模型列表 ---
     col1, col2, col3 = st.columns([2, 3, 2])   # 三列布局
@@ -520,7 +597,29 @@ with tab2:
                     model_name=selected_model,
                     base_url=base_url
                 )   # 创建 agent 实例，关掉 temperature 保证稳定
-                st.session_state.chat_history = []   # 清空历史
+                # 连接后确保有一个记忆会话可用
+                sessions = load_sessions()   # 重读会话列表
+                if not sessions:             # 没有任何会话：自动建默认会话
+                    n, t = make_new_session()
+                    st.session_state.current_thread_id = t
+                    st.session_state.session_name = n
+                    st.session_state.chat_history = []   # 新会话无历史
+                else:   # 已有会话：切到最新的一个并恢复历史
+                    first = sessions[0]
+                    st.session_state.current_thread_id = first["thread_id"]
+                    st.session_state.session_name = first["name"]
+                    st.session_state.chat_history = []   # 先清空，下面从记忆恢复
+                    try:
+                        state = st.session_state.agent.agent.get_state(
+                            {"configurable": {"thread_id": first["thread_id"]}})   # 读该会话记忆
+                        msgs = (state.values.get("messages") or []) if state else []   # 取消息列表
+                        for m in msgs:   # 遍历消息
+                            if getattr(m, "type", "") in ("human", "ai"):   # 只显示人/助手的
+                                role = "user" if m.type == "human" else "assistant"   # 角色映射
+                                if m.content:
+                                    st.session_state.chat_history.append({"role": role, "content": m.content})   # 恢复一条
+                    except Exception:
+                        pass   # 恢复失败不阻塞
                 st.success("Agent 已就绪")
             except Exception as e:
                 st.error(f"初始化失败: {e}")
@@ -545,6 +644,8 @@ with tab2:
     if user_input:
         if not st.session_state.agent:
             st.warning("请先配置 API Key 并初始化 Agent")  # 未就绪时提示
+        elif not st.session_state.current_thread_id:
+            st.warning("请先新建或选择一个记忆会话")  # 没有会话时提示
         else:
             st.session_state.chat_history.append({"role": "user", "content": user_input})  # 保存用户消息
             with st.chat_message("user"):
@@ -558,7 +659,8 @@ with tab2:
                 reasoning_text = ""                  # 推理过程
                 with st.status("思考中...", expanded=False) as status:   # 折叠状态框
                     try:
-                        for kind, payload in st.session_state.agent.ask_stream(user_input):   # 遍历流式片段
+                        for kind, payload in st.session_state.agent.ask_stream(
+                                user_input, thread_id=st.session_state.current_thread_id):   # 遍历流式片段，带当前会话记忆
                             if kind == "reasoning":        # 推理过程片段
                                 reasoning_text += payload  # 累加推理文本
                                 status.update(label=f"🤔 思考中 {len(reasoning_text)} 字...", expanded=False)   # 更新字数提示
