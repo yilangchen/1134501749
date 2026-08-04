@@ -16,16 +16,25 @@ from langgraph.checkpoint.sqlite import SqliteSaver   # LangGraph：会话记忆
 import sqlite3 as _sqlite3   # sqlite3：创建记忆存储的连接
 
 
+class _GenerationStopped(Exception):
+    """内部异常：用户点了"停止生成"，用于中断 agent 的工具/模型调用循环"""
+    pass   # 不做任何事，仅作标志；捕获时不当作报错，正常结束
+
+
 class _StreamMiddleware(AgentMiddleware):
     """拦截模型调用：改用原生 OpenAI 流式接口，实时把推理过程和正文放进队列"""
 
-    def __init__(self, queue_obj, llm):
+    def __init__(self, queue_obj, llm, stop_event):
         self.queue = queue_obj   # 流式片段队列
         self.llm = llm           # ChatOpenAI 实例（含 base_url / api_key / model）
+        self.stop_event = stop_event   # threading.Event：用户点"停止"时置位，流式循环据此中断
 
     def wrap_model_call(self, request: ModelRequest, handler):
         """模型调用钩子：绕过默认 invoke，改用原生流式 + 工具调用循环"""
         from openai import OpenAI   # 原生 SDK：直接读 reasoning_content 等原始字段
+
+        if self.stop_event.is_set():   # 用户已点停止：不再发起新的模型调用，直接中断 agent 循环
+            raise _GenerationStopped()   # 抛出中断标志，run_agent 捕获后正常结束
 
         messages = request.messages.copy()   # 复制消息列表，避免污染原状态
         if request.system_message:           # 有系统提示词则放最前
@@ -97,6 +106,8 @@ class _StreamMiddleware(AgentMiddleware):
         content_parts = []              # 正文片段列表（最后拼成完整回答）
         tool_calls_acc = {}             # 工具调用暂存：index -> {id, name, args}
         for chunk in stream:            # 遍历每个流式分块
+            if self.stop_event.is_set():   # 用户点了停止：立即中断流式接收，不再继续攒内容
+                break                    # 跳出循环，用已收到的片段收尾
             if not chunk.choices:       # 无 choices 则跳过
                 continue
             choice = chunk.choices[0]   # 第一个候选
@@ -119,6 +130,9 @@ class _StreamMiddleware(AgentMiddleware):
                             slot["args"] += tc.function.arguments   # 拼接参数 JSON
 
         content = "".join(content_parts)   # 完整正文
+
+        if self.stop_event.is_set():   # 流式中途被停止：放弃这一段（可能不完整），直接中断 agent 循环
+            raise _GenerationStopped()   # 抛出中断标志，run_agent 捕获后正常结束
 
         tool_calls = []   # 默认无工具调用（pydantic 要求列表，不能为 None）
         if tool_calls_acc:  # 模型要求调用工具
@@ -152,13 +166,22 @@ class Productiontool:
         self.checkpointer = SqliteSaver(self._memory_conn)   # 记忆检查点：按 thread_id 存取对话历史
         self.tools = self._setup_tools()   # 准备工具列表
         self._stream_queue = queue.Queue()   # 流式片段队列（线程间传递）
+        self._stop_event = threading.Event()   # 停止标志：用户点"停止生成"时置位，流式/agent循环据此中断
         self.agent = create_agent(         # 用 LangChain 组装智能体
             model=self.llm,                # 底层模型
             tools=self.tools,              # 可用工具
             system_prompt=self._make_prompt(),   # 系统提示词
-            middleware=[_StreamMiddleware(self._stream_queue, self.llm)],   # 挂载流式中间件
+            middleware=[_StreamMiddleware(self._stream_queue, self.llm, self._stop_event)],   # 挂载流式中间件（带停止标志）
             checkpointer=self.checkpointer,   # 挂载记忆检查点：invoke 时按 thread_id 自动读写对话历史
         )
+
+    def request_stop(self):
+        """请求停止当前正在进行的生成：置位停止标志，流式循环会在下个分块处中断"""
+        self._stop_event.set()   # 置位标志，让后台线程尽快停下
+
+    def reset_stop(self):
+        """新一轮提问前清空停止标志，允许再次正常生成"""
+        self._stop_event.clear()   # 清除标志，恢复生成能力
 
     def get_threads(self):
         """列出所有记忆会话的 thread_id（供界面做会话切换）"""
@@ -447,6 +470,7 @@ class Productiontool:
 
     def ask_stream(self, query: str, thread_id: str = "default"):
         """流式问答生成器：先流式输出推理过程，再逐 token 输出回答（带会话记忆）"""
+        self.reset_stop()   # 新轮提问先清空停止标志，保证能正常生成
         # 清空队列，确保本轮的片段干净
         while not self._stream_queue.empty():
             self._stream_queue.get_nowait()
@@ -459,6 +483,8 @@ class Productiontool:
                     {"messages": [HumanMessage(content=query)]},
                     config={"configurable": {"thread_id": thread_id}},   # 指定会话 ID，按此读写记忆
                 )   # 执行智能体
+            except _GenerationStopped:   # 用户点了"停止"：不算报错，正常结束本轮
+                pass                     # 不 put error，静默收尾
             except Exception as e:
                 self._stream_queue.put(("error", str(e)))   # 异常也放进队列
             finally:

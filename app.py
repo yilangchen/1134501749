@@ -94,6 +94,7 @@ st.title("设计 SPS 与 生产 SPS 查看")                       # 页面顶�
 
 tab1, tab2 = st.tabs(["S90 生产进度", " S90 助手"])  # 分两个标签页：生产进度看板 + LLM 助手
 with tab1:
+    st.session_state.setdefault("upload_reset_counter", 0)   # 上传区重置计数器：key 变则 Streamlit 重建上传框，达到"清空文件列表"效果
     with st.sidebar:
         st.header("数据导入中心")
         # 获取现有工区列表
@@ -110,15 +111,20 @@ with tab1:
             target_project_name = st.text_input("请输入工区名称 (如: 工区1)", "工区1")  # 弹出名称输入框
         else:
             target_project_name = selected_option              # 否则直接用选中的工区名
-        sp_files = st.file_uploader("1. 上传to_recorder (SPS)", type=['sps', 's', 'S01'], accept_multiple_files=True)  # 设计 SPS：支持多文件
+        _up_rev = st.session_state.upload_reset_counter   # 上传框 key 版本号：每点一次"重置上传"就 +1
+        sp_files = st.file_uploader("1. 上传to_recorder (SPS)", type=['sps', 's', 'S01'], accept_multiple_files=True, key=f"up1_{_up_rev}")  # 设计 SPS：支持多文件，key 带版本号
         # daily SPS 日期从文件名自动提取（格式 sw<线束号>-<mmdd>.sps，如 sw123-0731.sps）
         target_year = st.selectbox("作业年份", list(range(2020, 2031)), index=datetime.date.today().year - 2020)  # 作业年份下拉
-        daily_sps_file = st.file_uploader("2. 上传生产daily SPS", type=['sps', 's'], accept_multiple_files=True)  # daily SPS：支持多文件
+        daily_sps_file = st.file_uploader("2. 上传生产daily SPS", type=['sps', 's'], accept_multiple_files=True, key=f"up2_{_up_rev}")  # daily SPS：支持多文件，key 带版本号
         # 日期逻辑：每个 daily 文件的日期在读取阶段已从文件名提取（见下方 file_date_map）
         st.markdown("---")   # 分隔线
-        rejected_csv = st.file_uploader("3. 上传坏炮统计 rejected_summary (CSV)", type=['csv'], accept_multiple_files=True)  # 坏炮统计：支持多 CSV，日期从文件名提取
+        rejected_csv = st.file_uploader("3. 上传坏炮统计 rejected_summary (CSV)", type=['csv'], accept_multiple_files=True, key=f"up3_{_up_rev}")  # 坏炮统计：支持多 CSV，key 带版本号
         st.markdown("---")   # 分隔线
         save_btn = st.button("💾 确认入库")  # 确认入库按钮，点下才写数据库
+        # 重置上传区：key 版本号 +1 强制 Streamlit 重建三个上传框，视觉上清空已选文件列表
+        if st.button("🔄 重置上传区（清空已选文件）", use_container_width=True):
+            st.session_state.upload_reset_counter += 1   # 版本号 +1，三个上传框 key 变，旧文件列表不再显示
+            st.rerun()   # 立即重跑，侧边栏重建后上传框为空
 
     col_chart, col_stats = st.columns([3, 1])
     df_sp = pd.DataFrame()
@@ -755,6 +761,30 @@ with tab2:
         st.write("• 本月生产了多少炮？")
         st.write("• 最近 7 天每天的炮数")
         st.write("• 当前完成进度？")
+
+    # --- 工具按钮行：停止生成 / 清空对话 ---
+    tcol1, tcol2 = st.columns(2)   # 两列并排放两个工具按钮
+    with tcol1:
+        stop_clicked = st.button("⏹ 停止生成", use_container_width=True)   # 置位停止标志：下轮 agent 不再发起模型调用
+    with tcol2:
+        clear_clicked = st.button("🗑 清空对话", use_container_width=True)   # 清空当前会话的上下文与记忆
+
+    if stop_clicked and st.session_state.agent:
+        st.session_state.agent.request_stop()   # 置位 agent 的停止标志：下轮调用前被拦截
+        st.toast("已请求停止。若当前正在生成，下一轮将被中断。")   # 提示：方案A非实时，下轮生效
+        st.rerun()   # 立即重跑脚本，保证界面呈现停止状态
+
+    agent_ready = (st.session_state.agent is not None) and (st.session_state.current_thread_id is not None)   # agent 与会话都就绪才允许清空
+    if clear_clicked and agent_ready:
+        # 清空上下文：删掉该 thread 在记忆库里的全部检查点（清空对话记忆），但保留 agent_session 里的会话记录本身
+        tid = st.session_state.current_thread_id   # 当前会话的 thread_id（记忆键）
+        try:
+            st.session_state.agent.delete_thread(tid)   # 删掉该 thread 全部记忆检查点（清空上下文）
+        except Exception as e:
+            st.error(f"清空记忆失败: {e}")   # 删除异常提示，不中断
+        st.session_state.chat_history = []   # 清空界面聊天历史
+        st.toast("已清空当前会话对话与记忆。")   # 清空成功提示
+        st.rerun()   # 重跑脚本，界面立即显示空对话
 
     # --- 聊天输入 ---
     user_input = st.chat_input("输入问题...")
