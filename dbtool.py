@@ -174,6 +174,35 @@ class Productiontool:
         conn.execute("PRAGMA foreign_keys = ON")   # 开启外键，保证级联删除
         return conn
 
+    def _rejected_range_hint(self, project_name: str) -> str:
+        """查询某工区坏炮的全库日期范围，用于'当前日期范围查不到时'给出兜底提示。
+        返回形如'该工区坏炮实际分布在 2026-02-05 至 2026-02-05，共 141 条'。
+        自行开连接，不依赖调用方传入的连接（因为各工具的空分支可能在 with 块外）。"""
+        with self._get_conn() as conn:
+            row = conn.execute(
+            "SELECT MIN(wd.work_date), MAX(wd.work_date), COUNT(*) "
+            "FROM rejected_shot r "
+            "JOIN work_day wd ON wd.id = r.work_day_id "
+            "JOIN project p ON p.id = r.project_id "
+            "WHERE p.name = ?",
+            (project_name,)
+            ).fetchone()   # 该工区已关联作业日的坏炮最早/最晚日期 + 总数
+            unlinked = conn.execute(
+                "SELECT COUNT(*) FROM rejected_shot r "
+                "JOIN project p ON p.id = r.project_id "
+                "WHERE p.name = ? AND r.work_day_id IS NULL",
+                (project_name,)
+            ).fetchone()[0]   # 未关联到作业日的坏炮数（日期错位时的存量）
+            if row[2] == 0 and unlinked == 0:
+                return f"{project_name} 工区没有任何坏炮记录"   # 该工区彻底没坏炮
+            hint = f"注意：{project_name} 工区实际有坏炮"   # 兜底提示开头
+            if row[2] > 0:
+                hint += f"在 {row[0]} 至 {row[1]}（共 {row[2]} 条）"   # 已关联的日期范围
+            if unlinked > 0:
+                hint += f"；另有 {unlinked} 条坏炮未关联到作业日（日期可能更早）"   # 未关联提示
+            hint += "。请用这些日期范围重新调用工具，不要直接说'没有坏炮'。"   # 引导模型回查
+            return hint
+
     def _setup_tools(self):
         """定义全部工具，返回 LangChain 工具列表"""
 
@@ -285,9 +314,7 @@ class Productiontool:
                 ).fetchone()[0]   # 匹配不到作业日的坏炮数（日期错位时的存量）
             total = sum(r[1] for r in rows)   # 时间段内坏炮总数
             if total == 0:
-                return (f"{project_name} {start_date} 至 {end_date} 没有匹配到作业日的坏炮记录"
-                        f"（另有 {unlinked} 条坏炮未关联作业日）" if unlinked
-                        else f"{project_name} {start_date} 至 {end_date} 没有坏炮记录")   # 区分无数据 vs 有但未关联
+                return self._rejected_range_hint(project_name)   # 当前范围无结果：提示该工区实际坏炮分布，引导回查
             lines = [f"{project_name} {start_date} 至 {end_date} 共 {total} 条坏炮："]
             for reason, cnt in rows:   # 逐原因列出条数和占比
                 lines.append(f"- {reason}：{cnt} 条（{cnt / total * 100:.1f}%）")
@@ -315,7 +342,7 @@ class Productiontool:
             with self._get_conn() as conn:
                 rows = conn.execute(sql, params).fetchall()   # 明细行
             if not rows:
-                return f"{project_name} {start_date} 至 {end_date} 无符合条件的坏炮明细"   # 无明细提示
+                return self._rejected_range_hint(project_name)   # 明细为空：提示该工区实际坏炮分布，引导回查
             head = f"{project_name} {start_date} 至 {end_date}" + (f" 原因={reason}" if reason else "") + (f" 线={line}" if line else "") + f"，共 {len(rows)} 条："
             return head + "\n" + "\n".join(
                 f"{r[5]} 线{r[0]} 点{r[1]} 第{r[2]}次 {r[3]}：{r[4]}" for r in rows)   # 逐条列出
@@ -336,7 +363,7 @@ class Productiontool:
                     (project_name, start_date, end_date)
                 ).fetchall()   # 按 swath 聚合计数
             if not rows:
-                return f"{project_name} {start_date} 至 {end_date} 没有匹配到作业日的坏炮，无法按束聚合"   # 无数据提示
+                return self._rejected_range_hint(project_name)   # 当前范围无结果：提示该工区实际坏炮分布，引导回查
             total = sum(r[1] for r in rows)   # 总坏炮数
             lines = [f"{project_name} {start_date} 至 {end_date} 坏炮按束分布（共 {total} 条）："]
             for swath, cnt in rows:   # 逐束列出
@@ -377,7 +404,7 @@ class Productiontool:
                 ).fetchall()
             total = sum(r[1] for r in by_reason)   # 总坏炮数
             if total == 0:
-                return f"{project_name} {start_date} 至 {end_date} 没有坏炮记录"   # 无数据提示
+                return self._rejected_range_hint(project_name)   # 当前范围无结果：提示该工区实际坏炮分布，引导回查
             # 组装三段式报告：总览 / 原因分布 / 束与线分布
             out = [f"{project_name} {start_date} 至 {end_date} 坏炮综合报告（共 {total} 条）"]
             out.append("\n【原因分布】")
