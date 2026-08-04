@@ -55,35 +55,6 @@ def add_design_trace(fig, df_sp, max_shown=None):
     return fig
 
 
-def add_production_trace(fig, df_obs, max_shown=None):
-    """单独添加实际生产层 (亮绿色)"""
-    if df_obs is None or df_obs.empty:
-        return fig
-
-    # 预处理
-    df = df_obs.copy()     # 复制一份，避免污染原数据
-    df['Easting (m)'] = pd.to_numeric(df['Easting (m)'], errors='coerce')   # Easting 列转数值
-    df['Northing (m)'] = pd.to_numeric(df['Northing (m)'], errors='coerce')  # Northing 列转数值
-    df = df.dropna(subset=['Easting (m)', 'Northing (m)'])   # 丢弃坐标缺失的行
-
-    show_hover = max_shown is None or len(df) <= max_shown   # 是否允许显示悬浮信息
-    df = _stride_sample(df, max_shown)   # 按需降采样
-
-    fig.add_trace(go.Scattergl(
-        x=df['Easting (m)'],     # X 坐标列
-        y=df['Northing (m)'],    # Y 坐标列
-        mode='markers',          # 只画散点
-        name='实际生产',          # 图层名
-        marker=dict(
-            size=1,                # 点大小
-            color='#00CC96',       # 亮绿色
-            symbol='circle',       # 实心圆
-        ),
-        hovertext="实际 线:" + df['Line Name'].astype(str) + " 点:" + df['Point Number'].astype(str) if show_hover else None,  # 悬浮显示线号点号
-        hoverinfo="text+x+y" if show_hover else "skip"   # 降采样后禁用悬浮
-    ))
-    return fig
-
 def add_production_sps(fig, df_obs, max_shown=None):
     """单独添加实际生产层 (亮绿色)"""
     if df_obs is None or df_obs.empty:

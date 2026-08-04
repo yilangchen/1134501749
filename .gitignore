@@ -5,7 +5,8 @@
 
 #
 *.db
-
+*.db-shm
+*.db-wal
 *.sql
 # macOS
 
@@ -15,7 +16,7 @@
 # 虚拟环境
 
 venv/
-
+DATAFromVB
 .venv/
 # numpy
 

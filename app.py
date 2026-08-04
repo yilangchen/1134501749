@@ -61,6 +61,25 @@ CREATE INDEX IF NOT EXISTS idx_work_day_proj_date ON work_day (project_id, work_
 CREATE INDEX IF NOT EXISTS idx_shot_attempt_workday ON shot_attempt (work_day_id);            -- 按作业日查生产记录用
 CREATE INDEX IF NOT EXISTS idx_shot_attempt_designpt ON shot_attempt (design_point_id);       -- 按设计点查生产记录用
 
+CREATE TABLE IF NOT EXISTS rejected_shot (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,                                -- 主键自增
+    project_id      INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,        -- 所属工区，删工区时级联删除
+    work_day_id     INTEGER REFERENCES work_day(id) ON DELETE CASCADE,                -- 匹配到的作业日（可空：坏炮可能不在已入库生产记录中）
+    design_point_id INTEGER REFERENCES design_point(id) ON DELETE CASCADE,            -- 匹配到的设计点（可空：宽松关联，匹配不到也保留原始记录）
+    line            TEXT NOT NULL,                                                    -- 线号（冗余存储，即使没匹配上设计点也保留）
+    point           TEXT NOT NULL,                                                    -- 点号
+    shot_prompt     INTEGER,                                                          -- 第几次激发（1/2/3…，区分同一点多次重炮）
+    x               REAL,                                                             -- 坐标 X
+    y               REAL,                                                             -- 坐标 Y
+    shot_time       TEXT,                                                             -- 激发时间（已去掉 CSV 前导引号，如 '053410'）
+    reject_reason   TEXT NOT NULL,                                                    -- 坏炮原因原串（如 LowForceThreshold50）
+    src_file        TEXT,                                                             -- 来源 CSV 文件名（溯源用）
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP                                -- 创建时间
+);
+CREATE INDEX IF NOT EXISTS idx_rejected_proj_date ON rejected_shot (project_id, work_day_id);  -- 按工区日期查坏炮
+CREATE INDEX IF NOT EXISTS idx_rejected_reason    ON rejected_shot (reject_reason);           -- 按原因聚合统计
+CREATE INDEX IF NOT EXISTS idx_rejected_project   ON rejected_shot (project_id);              -- 按工区归档/删除
+
 CREATE TABLE IF NOT EXISTS agent_session (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,   -- 主键自增
     name       TEXT NOT NULL UNIQUE,                -- 会话显示名（唯一，如 "会话 20260801-1430"）
@@ -96,6 +115,8 @@ with tab1:
         target_year = st.selectbox("作业年份", list(range(2020, 2031)), index=datetime.date.today().year - 2020)  # 作业年份下拉
         daily_sps_file = st.file_uploader("2. 上传生产daily SPS", type=['sps', 's'], accept_multiple_files=True)  # daily SPS：支持多文件
         # 日期逻辑：每个 daily 文件的日期在读取阶段已从文件名提取（见下方 file_date_map）
+        st.markdown("---")   # 分隔线
+        rejected_csv = st.file_uploader("3. 上传坏炮统计 rejected_summary (CSV)", type=['csv'], accept_multiple_files=True)  # 坏炮统计：支持多 CSV，日期从文件名提取
         st.markdown("---")   # 分隔线
         save_btn = st.button("💾 确认入库")  # 确认入库按钮，点下才写数据库
 
@@ -183,6 +204,41 @@ with tab1:
             else:
                 st.warning(f"⚠ {fn} 未识别到日期，将跳过")  # 提示未识别的文件
 
+    # 坏炮统计 CSV 解析：逐个读取，日期从文件名提取（如 0205rejected_summary.csv → 2月5日），清洗后待入库
+    rejected_parts = []            # 暂存每个坏炮文件的 DataFrame
+    rejected_date_map = {}         # 文件名 -> 日期：坏炮所属作业日
+    if rejected_csv:
+        rejected_files = rejected_csv if isinstance(rejected_csv, list) else [rejected_csv]   # Streamlit 传1个文件时返回单对象不是列表
+        for f in rejected_files:
+            df_r = pd.read_csv(f)                           # 解析坏炮 CSV（有表头：Line,Point,shot prompt,X,Y,Time,RejectReason）
+            if 'RejectReason' not in df_r.columns:          # 关键列缺失则跳过，避免后续报错
+                st.sidebar.warning(f"⚠ {f.name} 缺少 RejectReason 列，已跳过")
+                continue
+            df_r['Time'] = df_r.get('Time').astype(str).str.lstrip("'") if 'Time' in df_r.columns else ''   # Time 去前导引号，如 '053410 → 053410
+            if 'shot prompt' in df_r.columns:               # 第几次激发：空/NaN 兜底为 1，转整数
+                sp = pd.to_numeric(df_r['shot prompt'], errors='coerce').fillna(1).astype('Int64')
+                df_r['shot prompt'] = sp
+            df_r['RejectReason'] = df_r['RejectReason'].astype(str).str.strip()   # 原因去首尾空格
+            df_r['_src_file'] = f.name                      # 标记来源文件名，溯源用
+            rejected_parts.append(df_r)                     # 收进列表
+            m = re.search(r'(\d{2})(\d{2})rejected', f.name, re.IGNORECASE)   # 从文件名匹配 mmdd（如 0205）
+            if m:
+                try:
+                    rejected_date_map[f.name] = datetime.date(target_year, int(m.group(1)), int(m.group(2)))   # 组装坏炮日期，年份用下拉选的
+                except ValueError:
+                    rejected_date_map[f.name] = None        # 日期不合法记为 None
+            else:
+                rejected_date_map[f.name] = None            # 文件名没有 mmdd 记为 None
+        if rejected_parts:
+            rejected_df = pd.concat(rejected_parts, ignore_index=True) if len(rejected_parts) > 1 else rejected_parts[0]   # 合并所有坏炮文件为一个表
+        else:
+            rejected_df = pd.DataFrame()                    # 没有可用文件则为空表
+        for fn, dt in rejected_date_map.items():            # 侧边栏展示每个坏炮文件的识别日期
+            if dt:
+                st.caption(f"📅 坏炮 {fn} → {dt}")
+            else:
+                st.warning(f"⚠ 坏炮 {fn} 未识别到日期，将跳过")
+
     # 数据确定入库
     if save_btn:
         project_id, _ = resolve_project_id(target_project_name)  # 解析工区 id
@@ -208,7 +264,8 @@ with tab1:
                               """, params)
                 conn.commit()  # 提交设计点写入
                 st.sidebar.success(f"上传并存储 {len(df_sp)} 个设计点")  # 侧边栏提示成功
-                load_all_designs.clear()   # 清绘图缓存，新设计点立即生效
+                if 'load_all_designs' in locals():   # 该缓存函数只在点击 Plot 后才定义，未定义时跳过清理（避免 NameError）
+                    load_all_designs.clear()   # 清绘图缓存，新设计点立即生效
             except sqlite3.Error as e:
                 st.sidebar.error(f"设计sps数据入库错误: {e}")  # 出错则提示错误信息
 
@@ -279,9 +336,70 @@ with tab1:
                         st.sidebar.success(msg)
                     else:
                         st.sidebar.warning(f"{target_date} 没有匹配到设计点的生产记录")  # 一条都没匹配上
-                    load_daily_sps.clear()   # 清绘图缓存，新生产点立即生效
+                    if 'load_daily_sps' in locals():   # 该缓存函数只在点击 Plot 后才定义，未定义时跳过清理（避免 NameError）
+                        load_daily_sps.clear()   # 清绘图缓存，新生产点立即生效
                 except Exception as e:
                     st.sidebar.error(f"daily sps入库失败: {e}")  # 入库过程出错
+
+        # 坏炮统计入库：按日期分组，每组覆盖式重建（同天重导 = 覆盖），宽松匹配设计点
+        if 'rejected_df' in locals() and rejected_df is not None and not rejected_df.empty:
+            rejected_date_groups = {}    # 日期 -> 该日期的坏炮行
+            for _, rrow in rejected_df.iterrows():
+                rdt = rejected_date_map.get(rrow['_src_file'])   # 取该行来源坏炮文件的日期
+                if rdt is None:
+                    continue   # 日期未识别的坏炮文件整组跳过
+                rejected_date_groups.setdefault(rdt, []).append(rrow)   # 按日期归组
+            for rdate, rday_rows in rejected_date_groups.items():
+                try:
+                    # 覆盖式：先删该工区该日期旧坏炮，再入库
+                    c.execute("""
+                              DELETE FROM rejected_shot
+                              WHERE work_day_id IN (
+                                  SELECT id FROM work_day WHERE project_id = ? AND work_date = ?
+                              )
+                              """, (project_id, rdate))   # 删同工区同日期旧坏炮，实现重新导入 = 覆盖
+                    # 确保 work_day 存在（坏炮也挂在作业日上）
+                    c.execute("INSERT OR IGNORE INTO work_day (project_id, work_date) VALUES (?, ?)",
+                              (project_id, rdate))       # 该日期不存在则插入，存在则忽略
+                    conn.commit()
+                    r_wd_id = c.execute("SELECT id FROM work_day WHERE project_id = ? AND work_date = ?",
+                                        (project_id, rdate)).fetchone()[0]   # 拿坏炮作业日 id
+                    r_rows = []          # 准备写入的坏炮列表
+                    matched = 0          # 记录匹配到设计点的坏炮数
+                    for rrow in rday_rows:
+                        # 宽松匹配设计点：优先 (line,point,swath) 退回 (line,point)——坏炮 CSV 无 swath 列，实际走 (line,point)
+                        r_dp = c.execute("""
+                                         SELECT id FROM design_point
+                                         WHERE project_id = ? AND line = ? AND point = ?
+                                         """, (project_id, rrow['Line'], rrow['Point'])).fetchone()   # 按线号点号匹配设计点
+                        dp_id = r_dp[0] if r_dp else None   # 匹配到就记 id，否则 NULL（宽松，不丢坏炮记录）
+                        if dp_id is not None:
+                            matched += 1   # 统计匹配数
+                        shot_prompt = int(rrow['shot prompt']) if pd.notna(rrow['shot prompt']) else 1   # 第几次激发
+                        r_rows.append((
+                            project_id, r_wd_id, dp_id,          # 工区/作业日/设计点外键
+                            str(rrow['Line']), str(rrow['Point']),   # 线号点号（转字符串便于一致比较）
+                            shot_prompt,                       # 激发次数
+                            rrow.get('X'), rrow.get('Y'),      # 坐标
+                            rrow.get('Time'),                  # 激发时间（已去引号）
+                            rrow['RejectReason'],              # 坏炮原因
+                            rrow['_src_file'],                 # 来源文件名
+                        ))
+                    if r_rows:
+                        c.executemany("""
+                                      INSERT INTO rejected_shot
+                                          (project_id, work_day_id, design_point_id, line, point,
+                                           shot_prompt, x, y, shot_time, reject_reason, src_file)
+                                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      """, r_rows)   # 批量写入坏炮
+                        conn.commit()
+                        rfnames = ", ".join(sorted({rrow['_src_file'] for rrow in rday_rows}))   # 该日期来源坏炮文件名
+                        rmsg = f"✅ {rdate} 坏炮已入库 {len(r_rows)} 条，匹配设计点 {matched} 条"   # 成功提示含匹配数
+                        if rfnames:
+                            rmsg += f"\n📁 文件: {rfnames}"   # 附文件名溯源
+                        st.sidebar.success(rmsg)
+                except Exception as e:
+                    st.sidebar.error(f"坏炮入库失败: {e}")   # 出错提示
 
     # 画图
     with col_chart:
