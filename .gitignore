@@ -29,6 +29,11 @@ DATAFromVB
 # 日志
 
 *.log
+
+# Streamlit 密钥（含 API Key，绝不能提交）
+
+.streamlit/secrets.toml
+.streamlit/
 # VSCode
 
 .vscode/

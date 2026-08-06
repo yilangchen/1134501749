@@ -178,12 +178,38 @@ with tab1:
         file_list_daily = daily_sps_file if isinstance(daily_sps_file, list) else [daily_sps_file]   # Streamlit 传1个文件时返回单对象不是列表
 
         def read_daily_file(f):
-            """读取单个 daily SPS 文件为 DataFrame"""
-            df = pd.read_csv(f, sep=r'\s+',                   # 按空格分隔解析
-                             header=None,                     # 无表头
-                             names=['S', 'Line', 'Point', 'index', 'X', 'Y', 'Elevation', 'GPS Time'],
-                             engine='python')
-            df['Swath'] = extract_swath(f.name)               # 从文件名提取 swath 号
+            """读取单个 daily SPS 文件为 DataFrame。
+            用正则从每行**行尾**提取 7-9 位 GPS 时间。规范是 9 位 `JJJHHMMSS`：前3位 JDAY(年积日)、后6位 `HHMMSS`（如 164115008 = 第164天 的 11:50:08）；也兼容 8 位格式（后6位同为 HHMMSS）。
+            高程与 GPS 时间可能**没有空格**(如 204.8164115008 粘连，高程204.8 + GPS164115008)，不能用固定空格分列，必须正则从行尾切出 GPS。"""
+            gps_pat = re.compile(r'\d{7,9}$')   # 行尾 7-9 位数字即 GPS 时间
+            records = []                        # 暂存每行解析结果
+            for line in f.read().decode("utf-8", errors="replace").splitlines():
+                if not line.strip():
+                    continue   # 跳过空行
+                m = gps_pat.search(line)        # 找行尾 GPS 数字串
+                if not m:
+                    continue   # 没有 GPS 数字则跳过（非采集数据行）
+                gps = m.group(0)                # 提出的 GPS 时间串
+                head = line[:m.start()].strip() # 去掉 GPS 部分，剩前段
+                cols = head.split()             # 前段按空白分列
+                if len(cols) < 7:
+                    continue   # 前段列数不足（S/LINE/POINT/index/X/Y/ELEV 至少7个）则跳过
+                rec = {
+                    'Line': cols[1],            # 第2列 测线号
+                    'Point': cols[2],           # 第3列 桩号
+                    'X': cols[-3],              # 从右数第3列 X 坐标
+                    'Y': cols[-2],              # 从右数第2列 Y 坐标
+                    'Elevation': cols[-1],      # 最右列 高程（正则已把粘连的 GPS 切走，剩纯高程）
+                    'GPS Time': gps,            # 正则提出的 7-9 位 GPS 时间
+                }
+                records.append(rec)             # 收进记录
+            df = pd.DataFrame(records)          # 所有行转 DataFrame
+            # 把 Line/Point/X/Y/Elevation 转成数值：与设计点入库的格式对齐。
+            # 设计点用 pd.read_csv 解析会把 '39169.00' 读成 float 39169.0，存成 '39169.0'；
+            # 这里若保留原始文本 '39169.00'，SQL 匹配 line='39169.00' 将匹配不到存库的 '39169.0'，导致生产炮全部失配。
+            for col in ['Line', 'Point', 'X', 'Y', 'Elevation']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')   # 转数值（无法转的置 NaN）
+            df['Swath'] = extract_swath(f.name) # 从文件名提取 swath 号
             return df
 
         daily_parts = []             # 暂存每个 daily 文件的 DataFrame
@@ -672,11 +698,21 @@ with tab2:
         st.divider()   # 分隔线
 
     # --- 配置区：base_url + api_key → 拉模型列表 ---
+    # 优先从 .streamlit/secrets.toml 读，刷新后自动带出，不用每次重填
+    try:
+        _llm_cfg = st.secrets.get("llm", {})   # 取 [llm] 分组配置
+        _default_base_url = _llm_cfg.get("base_url", "https://api.openai.com/v1")   # 地址默认值（secrets 或官方兜底）
+        _default_api_key = _llm_cfg.get("api_key", "")   # 密钥默认值（从 secrets 读，否则空）
+        _default_model = st.secrets.get("model_default", "gpt-4o")   # 默认模型名
+    except Exception:
+        _default_base_url = "https://api.openai.com/v1"   # secrets 读取异常：退回官方默认地址
+        _default_api_key = ""                             # 密钥退空
+        _default_model = "gpt-4o"                         # 模型退默认
     col1, col2, col3 = st.columns([2, 3, 2])   # 三列布局
     with col1:
-        base_url = st.text_input("API 地址", "https://api.openai.com/v1")  # API 地址
+        base_url = st.text_input("API 地址", value=_default_base_url)  # API 地址，带 secrets 预填
     with col2:
-        api_key = st.text_input("API Key", type="password")   # API 密钥，隐藏显示
+        api_key = st.text_input("API Key", value=_default_api_key, type="password")   # API 密钥，带 secrets 预填，隐藏显示
     with col3:
         st.write("")   # 占位对齐
         fetch_models = st.button("获取模型", use_container_width=True)   # 拉模型按钮
@@ -709,7 +745,7 @@ with tab2:
     if st.session_state.model_list:
         selected_model = st.selectbox("选择模型", st.session_state.model_list)   # 自动获取成功：下拉选
     else:
-        selected_model = st.text_input("手动输入模型名", "gpt-4o")   # 没拉到列表：手动填模型名
+        selected_model = st.text_input("手动输入模型名", _default_model)   # 没拉到列表：手动填模型名，带 secrets 默认
 
     # --- 初始化 agent ---
     if st.button("连接助手") and api_key:

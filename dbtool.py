@@ -438,10 +438,40 @@ class Productiontool:
             out += [f"- 线 {r[0]}：{r[1]} 条" for r in by_line]
             return "\n".join(out)
 
+        @tool
+        def get_hourly_efficiency(project_name: str, start_date: str, end_date: str,
+                                  start_hour: int, end_hour: int) -> str:
+            """计算某工区指定日期范围内每天的产出时效（炮/小时）。按天统计在 [start_hour, end_hour) 这个当日内时段（含 start_hour 点、不含 end_hour 点整）打的炮数，平均时效 = 该时段炮数 ÷ 时段小时数。用于回答"某天某个时间段的每小时产量/时效（如 5月每天 12点-18点 平均每小时多少炮）"。日期格式 YYYY-MM-DD，start_hour/end_hour 为 0-23 整数且 end_hour 必须大于 start_hour（只在当天内取段）。"""
+            if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23):
+                return "时段小时必须为 0-23 的整数"   # 参数越界提示
+            if end_hour <= start_hour:
+                return "end_hour 必须大于 start_hour（本工具只支持当天内的时段，不支持跨天）"   # 跨天不支持提示
+            span = end_hour - start_hour   # 时段小时数，如 12-18 为 6
+            with self._get_conn() as conn:
+                # 一天一行：该天落在时段内的炮数 + 平均时效（炮/小时）
+                rows = conn.execute(
+                    "SELECT wd.work_date, COUNT(*) "
+                    "FROM shot_attempt sa "
+                    "JOIN work_day wd ON wd.id = sa.work_day_id "
+                    "JOIN project p ON p.id = wd.project_id "
+                    "WHERE p.name = ? AND wd.work_date BETWEEN ? AND ? "
+                    "  AND CAST(substr(sa.gps_time, length(sa.gps_time) - 5, 2) AS INT) >= ? "
+                    "  AND CAST(substr(sa.gps_time, length(sa.gps_time) - 5, 2) AS INT) < ? "
+                    "GROUP BY wd.work_date ORDER BY wd.work_date",
+                    (project_name, start_date, end_date, start_hour, end_hour)
+                ).fetchall()   # 每天的在时段炮数（gps_time 是 JJJHHMMSS 之类，小时恒在最后6位的前2位，从后数第6位取2位兼容8/9位）
+            if not rows:
+                return f"{project_name} 在 {start_date} 至 {end_date} 的 {start_hour:02d}:00-{end_hour:02d}:00 时段没有生产炮数据"   # 空数据提示
+            lines = [f"{project_name} {start_date} 至 {end_date}，每天 {start_hour:02d}:00-{end_hour:02d}:00 时段时效（{span} 小时）："]
+            for date, cnt in rows:   # 每天一行
+                per_hour = f"{cnt / span:.1f}"   # 平均每小时的炮数
+                lines.append(f"- {date}：{cnt} 炮，平均 {per_hour} 炮/小时")
+            return "\n".join(lines)
+
         return [list_projects, get_design_count, get_total_shots,
                 get_daily_shots, get_completion_stats, get_work_days,
                 get_rejected_reasons, get_rejected_detail, get_rejected_by_swath,
-                get_rejected_report]
+                get_rejected_report, get_hourly_efficiency]
 
     def _make_prompt(self):
         """生成系统提示词，含当前日期和工具使用规则"""
@@ -461,6 +491,12 @@ class Productiontool:
 - 推荐流程：先 get_rejected_reasons 看主因分布 → 命中主因后用 get_rejected_detail 看具体炮 → 需要定位束/测线时用 get_rejected_by_swath 或 get_rejected_report 看是否系统性集中
 - 综合结论按三段式组织：①主要问题（占比最高的坏炮原因） ②疑似系统原因（某束 swath / 某测线坏炮是否异常集中） ③建议核查项（哪些具体炮/时间需要人工复核）
 - 若工具提示"有 N 条坏炮未关联到作业日"，说明这些坏炮日期可能早于已入库的生产记录，应在回答中单独说明，不要把"未关联"误读成"没有坏炮"
+
+### 时效/效率（炮/小时）
+- 用户问"某天某时段的时效""每小时多少炮""生产效率""几点到几点的产量"时，用 get_hourly_efficiency 按天统计，不编造数字
+- start_hour/end_hour 取当天内时间段（如"12点到18点"→ 12/18，开区间合计 6 小时，产出 炮/小时 = 时段炮数 ÷ 6）
+- 用户给了日期范围（如"5月"）就传该范围；不确定工区/日期范围先调 get_work_days
+- 回答时直接引用工具返回的"XX炮，平均XX炮/小时"，每天一行展示
 
 ### 规则
 - 涉及数据库的查询必须用工具，工具返回的数据直接引用，不要编造数字
