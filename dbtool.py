@@ -2,6 +2,7 @@
 # @TIME：
 # @AUTHOR：YiLang CHEN
 import sqlite3                  # sqlite3：连接 SQLite 数据库
+import re                       # re：校验工具参数里的日期格式（get_hourly_efficiency）
 import json                     # json：序列化消息给 OpenAI 接口
 import queue                    # queue：线程间传递流式片段
 import threading                # threading：后台线程执行模型调用
@@ -447,6 +448,11 @@ class Productiontool:
             if end_hour <= start_hour:
                 return "end_hour 必须大于 start_hour（本工具只支持当天内的时段，不支持跨天）"   # 跨天不支持提示
             span = end_hour - start_hour   # 时段小时数，如 12-18 为 6
+            # 校验日期格式：agent 若传"5月"等非标写法会导致 BETWEEN 字符串比较匹配不到、误报0炮
+            if not (re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_date) and
+                    re.fullmatch(r"\d{4}-\d{2}-\d{2}", end_date)):
+                return (f"日期必须是标准 YYYY-MM-DD 格式（如 2026-05-01），当前 start_date={start_date!r}、"
+                        f"end_date={end_date!r} 无法用于查询，请换算成具体日期再调用")   # 明确提示格式错误，避免误导为0炮
             with self._get_conn() as conn:
                 # 一天一行：该天落在时段内的炮数 + 平均时效（炮/小时）
                 rows = conn.execute(
@@ -468,10 +474,40 @@ class Productiontool:
                 lines.append(f"- {date}：{cnt} 炮，平均 {per_hour} 炮/小时")
             return "\n".join(lines)
 
+        @tool
+        def run_sql(sql: str) -> str:
+            """通用只读 SQL 查询。仅当没有任何业务工具能回答时兜底使用：根据系统提示词里的数据库 Schema 自行编写 SELECT 语句，然后调用本工具执行只读查询。禁止执行 INSERT / UPDATE / DELETE / DROP / ALTER 等任何写操作。参数 sql 为一条完整的 SELECT 查询语句。"""
+            s = sql.strip().split()   # 取 SQL 首词判断是否只读
+            if not s:   # 空语句
+                return "SQL 为空"
+            first = s[0].upper()   # 首词大写，判别命令类型
+            if first not in ("SELECT", "WITH", "PRAGMA", "EXPLAIN"):   # 白名单之外的都不放行
+                return f"只允许只读查询（SELECT / WITH / PRAGMA / EXPLAIN），收到 {first!r}。请仅执行 SELECT 语句，不要修改数据库。"
+            low = sql.lower()   # 大小写不敏感检查写关键字是否藏在语句里
+            if any(kw in low for kw in ("insert", "update", "delete", "drop", "alter", "create", "replace", "truncate")):   # 命中写关键字则拒绝
+                return "检测到写操作关键字（INSERT/UPDATE/DELETE/DROP/ALTER/CREATE 等），本工具只读，已拒绝执行。"
+            try:   # 执行只读查询
+                with self._get_conn() as conn:   # 临时连接，用完自动关闭
+                    cur = conn.execute(sql)   # 执行 SQL
+                    cols = [d[0] for d in cur.description] if cur.description else []   # 列名列表
+                    rows = cur.fetchall()   # 全部结果行（只读查询结果通常不大）
+            except sqlite3.Error as e:   # SQL 语法或执行错误
+                return f"SQL 执行失败：{e}。请根据数据库 Schema 修正后再试。"
+            if not rows:   # 空结果
+                return "（查询返回 0 行）"
+            # 组装成文本表格：表头一行 + 用制表符分隔每行，控制返回体积（最多 200 行，超限提示）
+            lines = ["\t".join(str(c) for c in cols)]   # 表头行
+            for r in rows[:200]:   # 只取前 200 行
+                cell = str(r[0]) if len(r) == 1 else "\t".join(str(x) for x in r)   # 单列直接转文本，多列制表符连接
+                lines.append(cell)   # 数据行
+            if len(rows) > 200:   # 结果超过 200 行时提示截断
+                lines.append(f"……（共 {len(rows)} 行，只显示前 200 行）")
+            return "\n".join(lines)   # 文本表格返回模型引用
+
         return [list_projects, get_design_count, get_total_shots,
                 get_daily_shots, get_completion_stats, get_work_days,
                 get_rejected_reasons, get_rejected_detail, get_rejected_by_swath,
-                get_rejected_report, get_hourly_efficiency]
+                get_rejected_report, get_hourly_efficiency, run_sql]
 
     def _make_prompt(self):
         """生成系统提示词，含当前日期和工具使用规则"""
@@ -498,8 +534,20 @@ class Productiontool:
 - 用户给了日期范围（如"5月"）就传该范围；不确定工区/日期范围先调 get_work_days
 - 回答时直接引用工具返回的"XX炮，平均XX炮/小时"，每天一行展示
 
-### 规则
-- 涉及数据库的查询必须用工具，工具返回的数据直接引用，不要编造数字
+### 数据库 Schema（需要自写 SQL 时用）
+只读查询可直接查这些表，字段关系如下（SQLite，各表关联用 JOIN）：
+- `project(id, name)` 工区；`name` 唯一。
+- `work_day(id, project_id, work_date)` 作业日；一天一行；`(project_id, work_date)` 唯一。项目名过滤用 `JOIN project p ON p.id = work_day.project_id WHERE p.name = ?`。
+- `design_point(id, project_id, line, point, x, y, batch_src, swath)` 设计点；`(project_id, line, point)` 唯一。`line`/`point` 是 TEXT 字符串（可能带 `.0` 后缀）。
+- `shot_attempt(id, work_day_id, design_point_id, elevation, gps_time, swath)` 生产炮；每炮挂一个作业日，外键 `work_day_id` 指向 `work_day.id`。炮数=该表行数。
+- `rejected_shot(id, project_id, work_day_id?, design_point_id?, line, point, shot_prompt, x, y, shot_time, reject_reason, src_file)` 坏炮；`work_day_id`/`design_point_id` 可空（未关联到作业日的坏炮会保留）。
+- 关联：生产炮按 `work_day_id` 关联作业日，坏炮按 `work_day_id` 关联作业日、按 `design_point_id` 关联设计点。
+- `gps_time` 是 9 位 `JJJHHMMSS`（也兼容 8 位），小时内含在 `substr(gps_time, length(gps_time)-5, 2)`（从后数第 6 位取 2 位），该表达式转 INT 后可与小时比较。
+
+### 混合模式：业务工具优先，通用 SQL 兜底
+- 优先用上面的业务工具回答常见问题（进度、炮数、按天、坏炮、时效等），工具返回的数据直接引用，不要编造数字
+- 只有当没有任何业务工具能回答当前问题时，才根据上面的 Schema 自行编写一条只读 SELECT，调用 run_sql 兜底查询
+- run_sql 只读，禁止写成写操作（INSERT/UPDATE/DELETE/DROP/ALTER/CREATE）；执行前想好 WHERE 条件，避免一次查全库
 - 与生产数据无关的闲聊正常回答即可
 - 回答用简体中文
 """

@@ -60,6 +60,9 @@ CREATE INDEX IF NOT EXISTS idx_design_point_lp    ON design_point (line, point);
 CREATE INDEX IF NOT EXISTS idx_work_day_proj_date ON work_day (project_id, work_date);        -- 按工区日期查作业日用
 CREATE INDEX IF NOT EXISTS idx_shot_attempt_workday ON shot_attempt (work_day_id);            -- 按作业日查生产记录用
 CREATE INDEX IF NOT EXISTS idx_shot_attempt_designpt ON shot_attempt (design_point_id);       -- 按设计点查生产记录用
+-- gps_time 小时表达式索引：get_hourly_efficiency 按 CAST(substr(gps_time, length-5, 2) AS INT) 范围过滤时走此索引，避免全表扫
+-- SQLite 支持表达式索引，substr 取倒数第6位起的2位=小时（兼容 8/9 位 GPS 格式）
+CREATE INDEX IF NOT EXISTS idx_shot_attempt_hour ON shot_attempt (CAST(substr(gps_time, length(gps_time) - 5, 2) AS INT));
 
 CREATE TABLE IF NOT EXISTS rejected_shot (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,                                -- 主键自增
@@ -88,6 +91,24 @@ CREATE TABLE IF NOT EXISTS agent_session (
 );
 """)
 conn.commit()  # 提交建表事务，表结构立即生效
+
+# 模块级缓存：全量设计点数 + 日期范围全量生产炮数。放模块级才能被 @st.cache_data 正确命中（函数内定义随重跑失效）。
+# 统计区用这个替代每次交互都打两条 COUNT SQL；参数（工区名+起止日期）不变时直接走缓存。
+@st.cache_data
+def _count_total(project_name: str, start_date, end_date):
+    sp = conn.execute("""
+                      SELECT COUNT(*) FROM design_point dp
+                      JOIN project p ON p.id = dp.project_id
+                      WHERE p.name = ?
+                      """, (project_name,)).fetchone()[0]   # 全量设计点数
+    sps = conn.execute("""
+                      SELECT COUNT(*) FROM shot_attempt sa
+                      JOIN work_day wd ON wd.id = sa.work_day_id
+                      JOIN project p ON p.id = wd.project_id
+                      WHERE p.name = ? AND wd.work_date BETWEEN ? AND ?
+                      """, (project_name, start_date, end_date)).fetchone()[0]   # 日期范围内全量生产炮
+    return int(sp), int(sps)   # 返回（设计数，生产数）
+
 # --- 1. 页面基本配置 (UI设置) ---
 st.set_page_config(page_title="Crew S90", layout="wide")  # 页面标题设为"Crew S90"，布局为宽屏
 st.title("设计 SPS 与 生产 SPS 查看")                       # 页面顶部大标题
@@ -311,16 +332,20 @@ with tab1:
                 date_groups.setdefault(dt, []).append(row)   # 按日期归组
             if not date_groups:
                 st.sidebar.warning("daily SPS 无法入库：未能从文件名识别到日期")  # 全部无法识别时提示
+            # 一次性把该工区设计点拉进内存字典，避免每炮 1 次 SQL（40万炮=40万次查询→1次查询）
+            # 两个字典：带 swath 的 (line,point,swath)->id，和不带 swath 退回的 (line,point)->id
+            dp_lp2id = {}        # (line, point) -> id，退回匹配用
+            dp_lp_sw2id = {}     # (line, point, swath) -> id，swath 优先匹配用
+            for dp_id, dp_line, dp_point, dp_sw in c.execute(
+                "SELECT id, line, point, swath FROM design_point WHERE project_id = ?",
+                (project_id,)
+            ).fetchall():   # 全工区设计点一次查回
+                dp_lp2id[(dp_line, dp_point)] = dp_id                       # 存 (line,point)->id
+                if dp_sw:                                              # 该设计点有 swath 才进带 swath 字典
+                    dp_lp_sw2id[(dp_line, dp_point, dp_sw)] = dp_id        # 存 (line,point,swath)->id
             for target_date, day_rows in date_groups.items():
                 try:
-                    # 覆盖式导入：先删该工区该日期的作业记录，再入库
-                    c.execute("""
-                              DELETE FROM shot_attempt
-                              WHERE work_day_id IN (
-                                  SELECT id FROM work_day WHERE project_id = ? AND work_date = ?
-                              )
-                              """, (project_id, target_date))   # 删掉同工区同日期旧数据，实现重新导入=覆盖
-                    # 确保 work_day 存在
+                    # 先确保 work_day 存在（新日期/老日期都要有这行，下面的存在性判断和写入都依赖它）
                     c.execute("INSERT OR IGNORE INTO work_day (project_id, work_date) VALUES (?, ?)",
                               (project_id, target_date))        # 该日期不存在则插入，存在则忽略
                     conn.commit()
@@ -330,30 +355,48 @@ with tab1:
                     rows = []         # 准备写入的生产记录列表
                     skip_swath = 0    # 记录 swath 不匹配但 (line,point) 匹配的炮数
                     for row in day_rows:
-                        if row.get('Swath'):
-                            dp = c.execute("""
-                                           SELECT id FROM design_point
-                                           WHERE project_id = ? AND line = ? AND point = ? AND swath = ?
-                                           """, (project_id, row['Line'], row['Point'], row['Swath'])).fetchone()  # 优先按 (line,point,swath) 匹配
-                            if dp is None:
-                                # 退而求其次：该工区确实有这个设计点，只是 swath 标注不一致
-                                alt = c.execute("""
-                                                SELECT id FROM design_point
-                                                WHERE project_id = ? AND line = ? AND point = ?
-                                                """, (project_id, row['Line'], row['Point'])).fetchone()  # 退回按 (line,point) 匹配
+                        line = str(row['Line'])    # 当前行线号转字符串做字典匹配（设计点存的是字符串）
+                        point = str(row['Point'])  # 当前行点号转字符串
+                        swath = row.get('Swath')    # 当前行 swath
+                        dp_id = None                # 匹配到的设计点 id，初始 None
+                        if swath:                                      # 该炮有 swath：优先按 (line,point,swath) 匹配
+                            dp_id = dp_lp_sw2id.get((line, point, swath))
+                            if dp_id is None:                            # (line,point,swath) 没命中：退回 (line,point)
+                                alt = dp_lp2id.get((line, point))
                                 if alt is not None:
-                                    skip_swath += 1   # 记录一次 swath 不一致
-                            dp = dp or alt            # 优先用 swath 匹配结果，否则用退回结果
-                        else:
-                            dp = c.execute("""
-                                           SELECT id FROM design_point
-                                           WHERE project_id = ? AND line = ? AND point = ?
-                                           """, (project_id, row['Line'], row['Point'])).fetchone()  # 没 swath 直接按 (line,point) 匹配
-                        if dp is None:
+                                    skip_swath += 1                       # 记录一次 swath 不一致
+                                    dp_id = alt                            # 用退回结果
+                        else:                                            # 该炮没 swath：直接按 (line,point) 匹配
+                            dp_id = dp_lp2id.get((line, point))
+                        if dp_id is None:
                             continue   # 匹配不到设计点，跳过这一炮
-                        rows.append((wd_id, dp[0], row['Elevation'], row['GPS Time'], row.get('Swath')))  # 组装入库元组
+                        rows.append((wd_id, dp_id, row['Elevation'], row['GPS Time'], row.get('Swath')))  # 组装入库元组
 
+                    # ---- "内容相同才跳过"：本次入库批 与 库里该日期当前全量 比对 ----
+                    # 判据：生产记录的核心标识键 (design_point_id, gps_time) 的多重集合完全相等才算"内容相同"。
+                    # 库里该日期若已存在一条相同键，说明之前已导过同一炮；本次批所有键都出现在库里 → 判定相同 → 跳过，
+                    # 避免重复导入 & 不误删任何已入库生产。若有任一键不同（新炮/改了时空）→ 走下方覆盖重建。
                     if rows:
+                        from collections import Counter   # Counter：多重集合，统计每个键出现的次数（区分重炮/重复键）
+                        cur_keys = Counter(              # 库里该日期现有的全部 (design_point_id, gps_time) 键
+                            (dp, gt) for dp, gt, _, _, _ in c.execute(
+                                "SELECT design_point_id, gps_time FROM shot_attempt WHERE work_day_id = ?",
+                                (wd_id,)).fetchall()
+                        )   # 一次 SELECT 拉回该日全量生产炮的时间点键
+                        new_keys = Counter((dp, gt) for _, dp, _, gt, _ in rows)   # 本次入库批的键（同结构）
+                        if cur_keys == new_keys:        # 多重集合完全相等：库里内容和本次完全一致
+                            st.sidebar.success(f"⏭ {target_date} 内容与库内完全一致，已跳过（未重复导入 {len(rows)} 炮）")
+                            if 'load_daily_sps' in locals():
+                                load_daily_sps.clear()   # 即便跳过也清一次缓存，确保前端内存态与库一致（无害）
+                            continue                     # 跳过本条日期，不进覆盖重建，直接处理下一日期
+                    # 覆盖式导入：只有本次确实有匹配到设计点的生产记录才删旧重建，避免“无匹配的空文件”误删当天既有数据
+                    if rows:
+                        c.execute("""
+                                  DELETE FROM shot_attempt
+                                  WHERE work_day_id IN (
+                                      SELECT id FROM work_day WHERE project_id = ? AND work_date = ?
+                                  )
+                                  """, (project_id, target_date))   # 删掉同工区同日期旧数据，实现重新导入=覆盖
                         c.executemany("""
                                       INSERT INTO shot_attempt (work_day_id, design_point_id, elevation, gps_time, swath)
                                       VALUES (?, ?, ?, ?, ?)
@@ -367,7 +410,7 @@ with tab1:
                             msg += f"（{skip_swath} 炮 swath 标注不一致，已按设计点归属）"  # 附上 swath 不一致数
                         st.sidebar.success(msg)
                     else:
-                        st.sidebar.warning(f"{target_date} 没有匹配到设计点的生产记录")  # 一条都没匹配上
+                        st.sidebar.warning(f"{target_date} 没有匹配到设计点的生产记录，未改动库内既有数据")  # 无匹配时提示，且不误删既有生产
                     if 'load_daily_sps' in locals():   # 该缓存函数只在点击 Plot 后才定义，未定义时跳过清理（避免 NameError）
                         load_daily_sps.clear()   # 清绘图缓存，新生产点立即生效
                 except Exception as e:
@@ -381,6 +424,13 @@ with tab1:
                 if rdt is None:
                     continue   # 日期未识别的坏炮文件整组跳过
                 rejected_date_groups.setdefault(rdt, []).append(rrow)   # 按日期归组
+            # dp_lp2id 在 daily 入库块已建好；若 daily 那块没跑（没传 daily），这里兜底建一次
+            if not dp_lp2id:
+                for dp_id, dp_line, dp_point in c.execute(
+                    "SELECT id, line, point FROM design_point WHERE project_id = ?",
+                    (project_id,)
+                ).fetchall():   # 全工区设计点一次查回（坏炮只按 line,point 匹配，无需 swath）
+                    dp_lp2id[(dp_line, dp_point)] = dp_id
             for rdate, rday_rows in rejected_date_groups.items():
                 try:
                     # 覆盖式：先删该工区该日期旧坏炮，再入库
@@ -399,12 +449,10 @@ with tab1:
                     r_rows = []          # 准备写入的坏炮列表
                     matched = 0          # 记录匹配到设计点的坏炮数
                     for rrow in rday_rows:
-                        # 宽松匹配设计点：优先 (line,point,swath) 退回 (line,point)——坏炮 CSV 无 swath 列，实际走 (line,point)
-                        r_dp = c.execute("""
-                                         SELECT id FROM design_point
-                                         WHERE project_id = ? AND line = ? AND point = ?
-                                         """, (project_id, rrow['Line'], rrow['Point'])).fetchone()   # 按线号点号匹配设计点
-                        dp_id = r_dp[0] if r_dp else None   # 匹配到就记 id，否则 NULL（宽松，不丢坏炮记录）
+                        # 宽松匹配设计点：坏炮 CSV 无 swath 列，实际走 (line,point) 字典内存匹配
+                        r_line = str(rrow['Line'])    # 坏炮线号转字符串做字典匹配
+                        r_point = str(rrow['Point'])  # 坏炮点号转字符串
+                        dp_id = dp_lp2id.get((r_line, r_point))   # 内存查匹配，无 SQL
                         if dp_id is not None:
                             matched += 1   # 统计匹配数
                         shot_prompt = int(rrow['shot prompt']) if pd.notna(rrow['shot prompt']) else 1   # 第几次激发
@@ -539,17 +587,8 @@ with tab1:
         st.markdown("### 📊 生产统计")
         if "df_design" in st.session_state and "df_daily" in st.session_state:   # 画过图才有统计
             # 统计数字独立于 swath 筛选：直接从 DB 查全量设计点数和全量生产炮数
-            total_sp = pd.read_sql("""
-                                   SELECT COUNT(*) FROM design_point dp
-                                   JOIN project p ON p.id = dp.project_id
-                                   WHERE p.name = ?
-                                   """, conn, params=(selected_project,)).iloc[0, 0]  # 该工区所有设计点（不受 swath 筛选影响）
-            total_sps = pd.read_sql("""
-                                    SELECT COUNT(*) FROM shot_attempt sa
-                                    JOIN work_day wd ON wd.id = sa.work_day_id
-                                    JOIN project p ON p.id = wd.project_id
-                                    WHERE p.name = ? AND wd.work_date BETWEEN ? AND ?
-                                    """, conn, params=(selected_project, selected_pro1, selected_pro2)).iloc[0, 0]  # 该工区日期范围内所有生产炮
+            # 用模块级 @st.cache_data 缓存全量计数，参数不变时直接命中，不重复打 COUNT SQL
+            total_sp, total_sps = _count_total(selected_project, selected_pro1, selected_pro2)   # 缓存命中则不打 SQL
             if total_sp > 0 and total_sps > 0:
                 progress_val = (total_sps / total_sp) if total_sp > 0 else 0   # 完成比例
                 # 1. 饼图展示
