@@ -6,6 +6,8 @@ import dbtool               # 本地 agent 工具，流式问答
 import requests             # requests：直接调 /models 接口拉取模型列表
 import os                   # os：执行清屏命令
 import re                   # re：正则表达式，从文件名提取 swath 号
+import io                   # io：内存字节缓冲，用于 Excel 文件下载
+import json                 # json：解析 agent 回答里的 chart 结构化数据
 import datetime             # datetime：提供日期输入框的默认值
 
 os.system('cls' if os.name == 'nt' else 'clear')  # 启动时清屏（Windows 用 cls，mac/Linux 用 clear）
@@ -52,6 +54,9 @@ CREATE TABLE IF NOT EXISTS shot_attempt (
     elevation       REAL,                                                           -- 高程
     gps_time        TEXT,                                                           -- GPS 时间
     swath           TEXT,                                                           -- 束号（冗余存储便于查询）
+    attempt         INTEGER,                                                        -- 激发次数：废炮 1/2，合格炮 3（区分同一物理点多次激发）
+    is_rejected     INTEGER NOT NULL DEFAULT 0,                                     -- 0=合格炮 1=废炮
+    reject_reason   TEXT,                                                           -- 废炮原因（仅废炮行有值）
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP                              -- 创建时间
 );
 
@@ -92,6 +97,18 @@ CREATE TABLE IF NOT EXISTS agent_session (
 """)
 conn.commit()  # 提交建表事务，表结构立即生效
 
+# --- 幂等 migration：给已存在的旧库 shot_attempt 补加废炮标记3列 ---
+# SQLite ADD COLUMN 只支持可空或带默认值的列，attempt/reject_reason 可空、is_rejected 有 DEFAULT 0，均满足。
+# 用 PRAGMA table_info 取现列，缺失才 ALTER，保证重复启动不报"column already exists"。
+_existing_cols = {r[1] for r in c.execute("PRAGMA table_info(shot_attempt)")}   # 当前 shot_attempt 所有列名集合
+if "attempt" not in _existing_cols:        # 缺 attempt 列才加
+    c.execute("ALTER TABLE shot_attempt ADD COLUMN attempt INTEGER")              # 激发次数（废炮1/2，合格炮3）
+if "is_rejected" not in _existing_cols:    # 缺 is_rejected 列才加
+    c.execute("ALTER TABLE shot_attempt ADD COLUMN is_rejected INTEGER NOT NULL DEFAULT 0")  # 0=合格炮 1=废炮
+if "reject_reason" not in _existing_cols:  # 缺 reject_reason 列才加
+    c.execute("ALTER TABLE shot_attempt ADD COLUMN reject_reason TEXT")           # 废炮原因
+conn.commit()  # 提交 migration，旧库补列即刻生效
+
 # 模块级缓存：全量设计点数 + 日期范围全量生产炮数。放模块级才能被 @st.cache_data 正确命中（函数内定义随重跑失效）。
 # 统计区用这个替代每次交互都打两条 COUNT SQL；参数（工区名+起止日期）不变时直接走缓存。
 @st.cache_data
@@ -105,9 +122,101 @@ def _count_total(project_name: str, start_date, end_date):
                       SELECT COUNT(*) FROM shot_attempt sa
                       JOIN work_day wd ON wd.id = sa.work_day_id
                       JOIN project p ON p.id = wd.project_id
-                      WHERE p.name = ? AND wd.work_date BETWEEN ? AND ?
-                      """, (project_name, start_date, end_date)).fetchone()[0]   # 日期范围内全量生产炮
+                      WHERE p.name = ? AND wd.work_date BETWEEN ? AND ? AND sa.is_rejected = 0
+                      """, (project_name, start_date, end_date)).fetchone()[0]   # 日期范围内合格炮数（排除废炮行）
     return int(sp), int(sps)   # 返回（设计数，生产数）
+
+
+# --- 出图：解析 agent 回答里的 ```chart JSON 块并渲染成 Plotly 图 ---
+_CHART_RE = re.compile(r"```chart\s*\n(.*?)```", re.DOTALL)   # 匹配标准 ```chart 围栏代码块
+_FALLBACK_JSON_RE = re.compile(r"(?:\{\"[^\n]*?\})\s*$", re.DOTALL)   # 兜底：匹配末尾独立成行的 JSON 对象（可能不用围栏）
+
+
+def _parse_chart_json(block):
+    """把一段文本尝试解析成 chart dict；结构不对返回 None。"""
+    try:
+        data = json.loads(block)                 # 文本转 JSON
+    except Exception:
+        return None                              # 解不了就不是图数据
+    if not isinstance(data, dict) or "columns" not in data or "rows" not in data:
+        return None                              # 缺 columns/rows 关键字段则丢弃
+    return data                                  # 返回合法图数据
+
+
+def _extract_chart(text):
+    """从 agent 回答里取出第一个 chart 代码块，解析成 dict；没有或解析失败则返回 None。
+    返回的 (chart, leftover) 里，leftover 是去掉 chart 块后剩余的正文。"""
+    if not text:
+        return None, text
+    m = _CHART_RE.search(text)                   # 优先找标准 ```chart 围栏块
+    if m:                                        # 命中标准块
+        leftover = _CHART_RE.sub("", text).strip()   # 剥掉围栏块留正文
+        chart = _parse_chart_json(m.group(1))    # 解析围栏内 JSON
+        return (chart, leftover) if chart is not None else (None, leftover)
+    f = _FALLBACK_JSON_RE.search(text)           # 无围栏：兜底找末尾成行的 JSON 对象
+    if not f:
+        return None, text                        # 都没有：退回纯文本
+    chart = _parse_chart_json(f.group(0))        # 解析兜底 JSON
+    if chart is None:
+        return None, text                        # 兜底也解析不了：原样返回
+    leftover = text[: f.start()].strip()         # 正文 = JSON 之前的部分
+    return chart, leftover                       # 返回（图数据, 纯正文）
+
+
+def render_chart(chart):
+    """把解析出的 chart dict 渲染成 Plotly 图并返回下界；附带导出 Excel 下载按钮。支持 timeseries/bar/pie 三类。"""
+    import plotly.graph_objects as go   # 局部导入，避免文件头依赖链被打乱
+    ctype = chart.get("type", "bar")    # 图类型，缺省用柱状图
+    title = chart.get("title", "")      # 图标题
+    columns = chart.get("columns", [])  # 列名列表
+    rows = chart.get("rows", [])        # 数据行（二维数组）
+    if not columns or not rows:         # 无数据则跳过，不画空图
+        return
+    x_name = columns[0]                 # 第 1 列当 x 轴 / 分类项
+    # 数值列 = 剩下所有列；值统一转 float/str，保证 Plotly 能画
+    y_cols = [c for c in columns[1:]]   # 后续列都是数值列
+    n_y = len(y_cols) or 1              # 至少一条序列
+    xs = [row[0] for row in rows]       # x 轴取值
+    if ctype == "pie":                  # 饼图：第 1 列是标签、后续某列是数值
+        labels = [str(x) for x in xs]   # 标签列表
+        values = [float(row[1]) if len(row) > 1 and row[1] not in (None, "") else 0 for row in rows]   # 用第 2 列当数值
+        fig = go.Figure(data=[go.Pie(labels=labels, values=values)])   # 生成饼图
+        fig.update_layout(title=title)  # 设标题
+    else:                               # 折线/柱状：逐条数值列画一条线或柱
+        fig = go.Figure()   # 空图
+        for j, yc in enumerate(y_cols):   # 每条数值列一条序列
+            ys = [float(row[1 + j]) if len(row) > 1 + j and row[1 + j] not in (None, "") else None for row in rows]   # 取该列数值，缺失置空
+            if ctype == "timeseries":     # 时序：画折线并标点
+                fig.add_trace(go.Scatter(x=xs, y=ys, name=yc, mode="lines+markers"))   # 折线+点
+            else:                         # bar：画柱状图
+                fig.add_trace(go.Bar(x=xs, y=ys, name=yc))   # 柱状
+        fig.update_layout(title=title, xaxis_title=x_name, barmode="group")   # 标题 + x 轴名 + 分组柱
+    st.plotly_chart(fig, use_container_width=True)   # 渲染交互图（宽度撑满容器）
+
+    # --- 导出 Excel 按钮：把 chart 数据转成 DataFrame 并下载 xlsx（无 openpyxl 则退化为 csv）---
+    try:
+        df = pd.DataFrame(rows, columns=columns[:len(rows[0])])   # 用原始网格做数据表（列数对齐实际行宽）
+        buf = io.BytesIO()   # 内存字节缓冲，供文件下载
+        try:
+            with pd.ExcelWriter(buf, engine="openpyxl") as w:   # 写 xlsx（需要 openpyxl）
+                df.to_excel(w, index=False)   # 不带行号写出
+            bio = buf.getvalue()   # 取字节内容
+            fname = f"{title or 'chart'}.xlsx"   # 文件名用标题
+            st.download_button("📥 导出 Excel", bio, file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")   # 下载按钮
+        except Exception:   # 无 openpyxl 时退化
+            csv_data = df.to_csv(index=False).encode("utf-8-sig")   # 转 csv（带 BOM 防 Excel 中文乱码）
+            st.download_button("📥 导出 Excel(CSV)", csv_data, file_name=f"{title or 'chart'}.csv", mime="text/csv")   # 兜底下载 csv
+    except Exception as e:   # 数据无法转 DataFrame 时静默跳过导出按钮，不影响图
+        st.caption(f"导出失败：{e}")   # 轻提示
+
+
+def _display_assistant_content(content):
+    """渲染一条助手消息：先剥出 chart 块画图，再把剩余正文当 markdown 显示。空正文不渲染。"""
+    chart, leftover = _extract_chart(content)   # 解析 chart 块，得到图数据 + 纯正文
+    if chart is not None:                        # 有 chart 就画图
+        render_chart(chart)                      # 渲染图 + 导出按钮
+    if leftover:                                 # 还有正文就显示
+        st.markdown(leftover)                    # markdown 渲染剩余文本
 
 # --- 1. 页面基本配置 (UI设置) ---
 st.set_page_config(page_title="Crew S90", layout="wide")  # 页面标题设为"Crew S90"，布局为宽屏
@@ -218,6 +327,7 @@ with tab1:
                 rec = {
                     'Line': cols[1],            # 第2列 测线号
                     'Point': cols[2],           # 第3列 桩号
+                    'Attempt': cols[3],         # 第4列 激发次数/attempt（同一物理点第几次激发，合格炮为最后那次）
                     'X': cols[-3],              # 从右数第3列 X 坐标
                     'Y': cols[-2],              # 从右数第2列 Y 坐标
                     'Elevation': cols[-1],      # 最右列 高程（正则已把粘连的 GPS 切走，剩纯高程）
@@ -228,7 +338,7 @@ with tab1:
             # 把 Line/Point/X/Y/Elevation 转成数值：与设计点入库的格式对齐。
             # 设计点用 pd.read_csv 解析会把 '39169.00' 读成 float 39169.0，存成 '39169.0'；
             # 这里若保留原始文本 '39169.00'，SQL 匹配 line='39169.00' 将匹配不到存库的 '39169.0'，导致生产炮全部失配。
-            for col in ['Line', 'Point', 'X', 'Y', 'Elevation']:
+            for col in ['Line', 'Point', 'X', 'Y', 'Elevation', 'Attempt']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')   # 转数值（无法转的置 NaN）
             df['Swath'] = extract_swath(f.name) # 从文件名提取 swath 号
             return df
@@ -273,6 +383,11 @@ with tab1:
                 df_r['shot prompt'] = sp
             df_r['RejectReason'] = df_r['RejectReason'].astype(str).str.strip()   # 原因去首尾空格
             df_r['_src_file'] = f.name                      # 标记来源文件名，溯源用
+            # swath 列（废炮明细 CSV 用户会加）：有则清洗去空、无则补空列，避免后续入库时 KeyError
+            if 'swath' not in df_r.columns:
+                df_r['swath'] = ''                         # 无 swath 列的旧格式补空
+            else:
+                df_r['swath'] = df_r['swath'].astype(str).str.strip()   # 有则去首尾空格，空值保持空
             rejected_parts.append(df_r)                     # 收进列表
             m = re.search(r'(\d{2})(\d{2})rejected', f.name, re.IGNORECASE)   # 从文件名匹配 mmdd（如 0205）
             if m:
@@ -370,20 +485,25 @@ with tab1:
                             dp_id = dp_lp2id.get((line, point))
                         if dp_id is None:
                             continue   # 匹配不到设计点，跳过这一炮
-                        rows.append((wd_id, dp_id, row['Elevation'], row['GPS Time'], row.get('Swath')))  # 组装入库元组
+                        attempt = row.get('Attempt')   # 本次激发次数（合格炮）；daily 无此值则 None
+                        if attempt is not None and not pd.isna(attempt):   # 有值才转 int
+                            attempt = int(attempt)   # 转整数
+                        # 组装 8 元组：合格炮 is_rejected=0、reject_reason=None
+                        rows.append((wd_id, dp_id, row['Elevation'], row['GPS Time'], row.get('Swath'),
+                                     attempt, 0, None))   # (work_day_id, design_point_id, elevation, gps_time, swath, attempt, is_rejected, reject_reason)
 
                     # ---- "内容相同才跳过"：本次入库批 与 库里该日期当前全量 比对 ----
-                    # 判据：生产记录的核心标识键 (design_point_id, gps_time) 的多重集合完全相等才算"内容相同"。
-                    # 库里该日期若已存在一条相同键，说明之前已导过同一炮；本次批所有键都出现在库里 → 判定相同 → 跳过，
-                    # 避免重复导入 & 不误删任何已入库生产。若有任一键不同（新炮/改了时空）→ 走下方覆盖重建。
+                    # 判据：生产记录区分键 (design_point_id, swath, attempt) 的多重集合完全相等才算"内容相同"。
+                    # （同一 (line,point) 可跨 swath 重复、同点同 swath 可有多次 attempt，故三要素才唯一）
+                    # 库里该日期已存在相同键 → 本次批全都在库里 → 判定相同 → 跳过；有任一键不同 → 覆盖重建。
                     if rows:
                         from collections import Counter   # Counter：多重集合，统计每个键出现的次数（区分重炮/重复键）
-                        cur_keys = Counter(              # 库里该日期现有的全部 (design_point_id, gps_time) 键
-                            (dp, gt) for dp, gt, _, _, _ in c.execute(
-                                "SELECT design_point_id, gps_time FROM shot_attempt WHERE work_day_id = ?",
+                        cur_keys = Counter(              # 库里该日期现有的全部 (design_point_id, swath, attempt) 键
+                            (dp, sw, at) for dp, sw, at in c.execute(
+                                "SELECT design_point_id, swath, attempt FROM shot_attempt WHERE work_day_id = ?",
                                 (wd_id,)).fetchall()
-                        )   # 一次 SELECT 拉回该日全量生产炮的时间点键
-                        new_keys = Counter((dp, gt) for _, dp, _, gt, _ in rows)   # 本次入库批的键（同结构）
+                        )   # 一次 SELECT 拉回该日全量生产炮的区分键
+                        new_keys = Counter((dp, sw, at) for _, dp, _, _, sw, at, _, _ in rows)   # 本次入库批的键（同结构）
                         if cur_keys == new_keys:        # 多重集合完全相等：库里内容和本次完全一致
                             st.sidebar.success(f"⏭ {target_date} 内容与库内完全一致，已跳过（未重复导入 {len(rows)} 炮）")
                             if 'load_daily_sps' in locals():
@@ -398,9 +518,10 @@ with tab1:
                                   )
                                   """, (project_id, target_date))   # 删掉同工区同日期旧数据，实现重新导入=覆盖
                         c.executemany("""
-                                      INSERT INTO shot_attempt (work_day_id, design_point_id, elevation, gps_time, swath)
-                                      VALUES (?, ?, ?, ?, ?)
-                                      """, rows)       # 批量写入生产记录
+                                      INSERT INTO shot_attempt (work_day_id, design_point_id, elevation, gps_time, swath,
+                                                                attempt, is_rejected, reject_reason)
+                                      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                      """, rows)       # 批量写入生产记录（含 attempt、是否废炮、废炮原因）
                         conn.commit()
                         fnames = ", ".join(sorted({row['_src_file'] for row in day_rows}))  # 该日期的来源文件名
                         msg = f"✅ {target_date} 的 daily SPS 已入库！匹配 {len(rows)} 炮"  # 成功提示
@@ -424,13 +545,16 @@ with tab1:
                 if rdt is None:
                     continue   # 日期未识别的坏炮文件整组跳过
                 rejected_date_groups.setdefault(rdt, []).append(rrow)   # 按日期归组
-            # dp_lp2id 在 daily 入库块已建好；若 daily 那块没跑（没传 daily），这里兜底建一次
+            # dp_lp2id / dp_lp_sw2id 在 daily 入库块已建好；若 daily 那块没跑（没传 daily），这里兜底建一次
             if not dp_lp2id:
-                for dp_id, dp_line, dp_point in c.execute(
-                    "SELECT id, line, point FROM design_point WHERE project_id = ?",
+                dp_lp_sw2id = {}   # 建带 swath 的字典（废炮匹配按 swath 优先需要）
+                for dp_id, dp_line, dp_point, dp_sw in c.execute(
+                    "SELECT id, line, point, swath FROM design_point WHERE project_id = ?",
                     (project_id,)
-                ).fetchall():   # 全工区设计点一次查回（坏炮只按 line,point 匹配，无需 swath）
-                    dp_lp2id[(dp_line, dp_point)] = dp_id
+                ).fetchall():   # 全工区设计点一次查回（含 swath）
+                    dp_lp2id[(dp_line, dp_point)] = dp_id                      # (line,point)->id
+                    if dp_sw:
+                        dp_lp_sw2id[(dp_line, dp_point, dp_sw)] = dp_id        # (line,point,swath)->id
             for rdate, rday_rows in rejected_date_groups.items():
                 try:
                     # 覆盖式：先删该工区该日期旧坏炮，再入库
@@ -446,16 +570,22 @@ with tab1:
                     conn.commit()
                     r_wd_id = c.execute("SELECT id FROM work_day WHERE project_id = ? AND work_date = ?",
                                         (project_id, rdate)).fetchone()[0]   # 拿坏炮作业日 id
-                    r_rows = []          # 准备写入的坏炮列表
+                    r_rows = []          # 准备写入坏炮表的行（rejected_shot）
+                    sa_reject_rows = []  # 准备写入生产表的废炮行（shot_attempt, is_rejected=1）
                     matched = 0          # 记录匹配到设计点的坏炮数
                     for rrow in rday_rows:
-                        # 宽松匹配设计点：坏炮 CSV 无 swath 列，实际走 (line,point) 字典内存匹配
+                        # 宽松匹配设计点：坏炮 CSV 的 swath 列（用户已加）优先，无则退回 (line,point)
                         r_line = str(rrow['Line'])    # 坏炮线号转字符串做字典匹配
                         r_point = str(rrow['Point'])  # 坏炮点号转字符串
-                        dp_id = dp_lp2id.get((r_line, r_point))   # 内存查匹配，无 SQL
+                        r_swath = rrow.get('swath') or None   # 废炮 swath（可能为空）
+                        dp_id = None                  # 匹配到的设计点 id
+                        if r_swath:                   # 有 swath：按 (line,point,swath) 优先
+                            dp_id = dp_lp_sw2id.get((r_line, r_point, r_swath))
+                        if dp_id is None:             # 没 swath 或 swath 没命中：退 (line,point)
+                            dp_id = dp_lp2id.get((r_line, r_point))
                         if dp_id is not None:
                             matched += 1   # 统计匹配数
-                        shot_prompt = int(rrow['shot prompt']) if pd.notna(rrow['shot prompt']) else 1   # 第几次激发
+                        shot_prompt = int(rrow['shot prompt']) if pd.notna(rrow['shot prompt']) else 1   # 第几次激发（=attempt）
                         r_rows.append((
                             project_id, r_wd_id, dp_id,          # 工区/作业日/设计点外键
                             str(rrow['Line']), str(rrow['Point']),   # 线号点号（转字符串便于一致比较）
@@ -465,16 +595,36 @@ with tab1:
                             rrow['RejectReason'],              # 坏炮原因
                             rrow['_src_file'],                 # 来源文件名
                         ))
+                        # 同步把废炮以"独立行"写进 shot_attempt（is_rejected=1，带 attempt 和原因）。
+                        # 注意 shot_attempt.design_point_id 是 NOT NULL：匹配不到设计点的废炮无法写生产表，
+                        # 只能留在坏炮表（其 design_point_id 可空），因此仅 dp_id 非空才追加废炮行。
+                        if dp_id is not None:
+                            sa_reject_rows.append((
+                                r_wd_id, dp_id,            # work_day_id, design_point_id（已确认非空）
+                                None,                      # elevation：坏炮 CSV 无高程
+                                rrow.get('Time'),          # gps_time = 清洗后激发时间
+                                r_swath,                   # swath
+                                shot_prompt,               # attempt = 激发次数
+                                1,                         # is_rejected = 1（废炮）
+                                rrow['RejectReason'],      # reject_reason = 坏炮原因
+                            ))
                     if r_rows:
                         c.executemany("""
                                       INSERT INTO rejected_shot
                                           (project_id, work_day_id, design_point_id, line, point,
                                            shot_prompt, x, y, shot_time, reject_reason, src_file)
                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                      """, r_rows)   # 批量写入坏炮
+                                      """, r_rows)   # 批量写入坏炮表
+                    if sa_reject_rows:
+                        c.executemany("""
+                                      INSERT INTO shot_attempt
+                                          (work_day_id, design_point_id, elevation, gps_time, swath,
+                                           attempt, is_rejected, reject_reason)
+                                      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                      """, sa_reject_rows)   # 批量写入废炮行到生产表（is_rejected=1，带原因）
                         conn.commit()
                         rfnames = ", ".join(sorted({rrow['_src_file'] for rrow in rday_rows}))   # 该日期来源坏炮文件名
-                        rmsg = f"✅ {rdate} 坏炮已入库 {len(r_rows)} 条，匹配设计点 {matched} 条"   # 成功提示含匹配数
+                        rmsg = f"✅ {rdate} 坏炮已入库 {len(r_rows)} 条（废炮进生产表 {len(sa_reject_rows)} 条），匹配设计点 {matched} 条"   # 成功提示含匹配数
                         if rfnames:
                             rmsg += f"\n📁 文件: {rfnames}"   # 附文件名溯源
                         st.sidebar.success(rmsg)
@@ -545,6 +695,7 @@ with tab1:
                             JOIN work_day wd ON wd.id = sa.work_day_id
                             JOIN project p ON p.id = wd.project_id
                             WHERE p.name = ? AND wd.work_date BETWEEN ? AND ?
+                              AND sa.is_rejected = 0  -- 只画合格炮，排除废炮行
                               AND sa.swath IN ({placeholders})   -- 按生产记录的 swath 筛选
                             ORDER BY wd.work_date, dp.line, dp.point
                             """
@@ -563,8 +714,9 @@ with tab1:
                         JOIN work_day wd ON wd.id = sa.work_day_id
                         JOIN project p ON p.id = wd.project_id
                         WHERE p.name = ? AND wd.work_date BETWEEN ? AND ?
+                          AND sa.is_rejected = 0   -- 只画合格炮，排除废炮行
                         ORDER BY wd.work_date, dp.line, dp.point
-                        """   # 不筛选 swath，查全部生产点
+                        """   # 不筛选 swath，查全部合格生产点
                 return pd.read_sql(
                     query,
                     conn,
@@ -828,7 +980,10 @@ with tab2:
     # --- 显示历史消息 ---
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
-            st.write(msg["content"])   # 逐条渲染历史
+            if msg["role"] == "assistant":   # 助手消息走"剥 chart + 画图"渲染
+                _display_assistant_content(msg["content"])
+            else:                            # 用户消息直接文本显示
+                st.write(msg["content"])     # 逐条渲染历史
 
     # --- 快捷提问 ---
     with st.expander("💡 提示示例"):
@@ -889,7 +1044,8 @@ with tab2:
                                 status.update(label=f"🤔 思考中 {len(reasoning_text)} 字...", expanded=False)   # 更新字数提示
                             elif kind == "content":        # 正文片段
                                 full_response += payload   # 累加正文
-                                placeholder.markdown(full_response)   # 实时更新显示
+                                _, show_text = _extract_chart(full_response)   # 实时剥掉 chart 块，避免把 JSON 当正文显示
+                                placeholder.markdown(show_text)   # 只显示自然语言正文
                     except Exception as e:
                         placeholder.error(f"出错了: {e}")   # 错误提示
                         full_response = f"[错误] {e}"        # 记录错误到历史
@@ -900,4 +1056,5 @@ with tab2:
                         st.write(reasoning_text)       # 显示推理全文
                 elif reasoning_text and not full_response:   # 只有推理没正文（异常情况）
                     st.write(reasoning_text)   # 直接显示推理
+                _display_assistant_content(full_response)   # 渲染图 + 正文（chart 块剥离、解析、画图、导出按钮）
                 st.session_state.chat_history.append({"role": "assistant", "content": full_response})   # 保存回复

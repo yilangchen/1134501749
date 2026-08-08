@@ -44,14 +44,15 @@ project (工区)
 | `project` | `id, name` | `name` UNIQUE |
 | `work_day` | `id, project_id, work_date` | `(project_id, work_date)` UNIQUE |
 | `design_point` | `id, project_id, line, point, x, y, batch_src, swath` | `(project_id, line, point)` UNIQUE |
-| `shot_attempt` | `id, work_day_id, design_point_id, elevation, gps_time, swath` | 两个外键均 NOT NULL |
+| `shot_attempt` | `id, work_day_id, design_point_id, elevation, gps_time, swath, attempt, is_rejected, reject_reason` | 两个外键均 NOT NULL；`attempt`/`is_rejected`/`reject_reason` 为 **2026-08-07 新增** |
 | `rejected_shot` | `id, project_id, work_day_id? , design_point_id? , line, point, shot_prompt, x, y, shot_time, reject_reason, src_file` | `work_day_id`/`design_point_id` 可空 |
 
 要点：
 - 设计点按 `(line, point)` 去重；`batch_src` 为逗号连接字符串，仅记"该点来自哪次导入"（如 `3,5,7`），不是独立表。
 - `swath` 列：导入时从**文件名**提取（`re.search(r'(sw\d+)', 文件名)`），如 `sw123_sps_for_recorder.sps` → `sw123`、`sw123_0731.sps` → `sw123`。设计 SPS 和 daily SPS 都会提取，daily 导入时优先按 `(line, point, swath)` 匹配设计点，匹配不到再退回纯 `(line, point)`。
 - 生产炮按 `line + point` 匹配设计点，匹配不到就跳过该行（`app.py` 会提示匹配了几炮）。导入顺序必须是先设计 SPS、再 daily SPS。
-- `rejected_shot`（坏炮表）：独立表存 VB 导出的坏炮统计 CSV（如 `0205rejected_summary.csv`），**不塞进 shot_attempt**——因为坏炮常不在 daily SPS 里（如 0205 坏炮而库里作业日从 0206 起）。`work_day_id`/`design_point_id` 可空（宽松关联：按 `(line, point)` 匹配设计点，匹配不到也保留原始 line/point/time，不丢记录）。`shot_prompt` 存第几次激发（同一物理点重炮区分）。`shot_time` 已去掉 CSV 前导 `'`。按日期从**文件名**提取（`0205rejected_summary.csv` → 2月5日 + 侧边栏年份）。
+- `rejected_shot`（坏炮表）：独立表存 VB 导出的坏炮统计 CSV（如 `0205rejected_summary.csv`）。`work_day_id`/`design_point_id` 可空（宽松关联：按 `(line, point)` 匹配设计点，匹配不到也保留原始 line/point/time，不丢记录）。`shot_prompt` 存第几次激发（同一物理点重炮区分，即 attempt）。`shot_time` 已去掉 CSV 前导 `'`。按日期从**文件名**提取（`0205rejected_summary.csv` → 2月5日 + 侧边栏年份）。
+- **废炮镜像进生产表（2026-08-07）**：坏炮 CSV 导入时，除写 `rejected_shot` 外，还会把**匹配到设计点**的废炮以独立行写进 `shot_attempt`（`is_rejected=1`、`attempt`=shot prompt、`reject_reason`=原因、`swath` 从 CSV 的 swath 列取；CSV 无 swath 列则补空并退回 (line,point) 匹配）。因此同一 (line,point,swath) 下 `shot_attempt` 可同时有 合格行（is_rejected=0，来自 daily）和 废炮行（is_rejected=1，来自坏炮 CSV），**靠 attempt 区分**（废炮 attempt 恒小于合格炮）。**统计/绘图/产量工具一律只算 `is_rejected=0`**，废炮独立行不计产量。匹配不到的废炮由于 `shot_attempt.design_point_id` 是 NOT NULL，只进坏炮表不写生产表。
 - 删 `project` → 级联删全部；删 `work_day` → 级联删当天 shot_attempt。
 - `mmp_records` 为遗留表（4 行），仍在使用但未重构。
 - 旧表 `design_sps_db` / `daily_sps_db` / `daily_obs_db` 已废弃但保留在库中未删，可回滚。
@@ -62,9 +63,15 @@ project (工区)
 - 设计 SPS 和 daily SPS 都支持多文件；`swath` 从每个文件名提取。
 - daily SPS 日期提取：用 `r'[-_](\d{2})(\d{2})\.\w+$'` 从文件名末尾匹配 `-MMDD.ext` 或 `_MMDD.ext`（如 `sw123-0731.sps` → 7月31日）。年份从下拉选的，日期完全自动识别，不提供手动日期输入框。
 - **多天导入**：每个文件按自己的文件名日期独立入库（`file_date_map` 文件名→日期），一次可上传多个不同日期的文件，自动按日期分组，同一天的文件会被覆盖式合并。
+- daily SPS：**就近幂等保护（2026-08-07）**——先 `INSERT OR IGNORE` 确保 work_day 存在，再组装本批生产记录，然后与库里该日期现有生产比较：
+  - 若本次批的 `(design_point_id, swath, attempt)` 多重集合（`Counter`，精确统计重炮/重复键；同一 (line,point) 可跨 swath 重复、同点同 swath 多次 attempt，故三要素才唯一）与库里该日期现有记录**完全相等** → 判定"内容相同"，侧边栏提示"已跳过"，**不重复导入**。
+  - 若内容不同（有新增/改动）→ 才走"先删该工区该日期旧炮再重建"（覆盖 = 同天重导）。
+  - **空匹配保护**：本批一炮都没匹配到设计点（rows 空）时，**不执行 DELETE**，提示"未改动库内既有数据"，避免误删当天已入库生产。原版无条件 DELETE 会导致空文件误删，已改。
+  - 判据用 `Counter`（多重集合）而非普通 Set，因为 05-12/05-27 等日期是两份 daily 叠加（一半 `(line,point)` 重复），普通集合会误判"内容不同"而重复覆盖。
+- **导入性能（2026-08-07）**：daily 与坏炮依赖设计点匹配，已改为**一次性把全工区设计点拉进内存字典**（`dp_lp2id` + `dp_lp_sw2id`，键为 `(line,point)` 与 `(line,point,swath)`）做 `.get()` 快速匹配，不再逐炮查 SQL（40 万炮 = 1 次查询）。`gps_time` 有表达式索引 `idx_shot_attempt_hour`（`CAST(substr(gps_time, length-5,2) AS INT)`）供时效查询走索引。设计点 `line`/`point` 存的是字符串（可能带 `.0` 后缀），daily 匹配时用 `str(row['Line'])`/`pd.to_numeric` 对齐格式。
 - 设计 SPS：幂等 upsert（`ON CONFLICT (project_id,line,point) DO UPDATE`），重复导入更新坐标、追加 `batch_src`、`swath` 为空时不覆盖已有值。
-- daily SPS：先删该工区该日期的旧炮再重建（**同天重新导入 = 覆盖**）。入库成功后侧边栏显示导入文件清单。
-- 坏炮 CSV：解析后 `Time` 去前导 `'`、`shot prompt` 空转 1、`RejectReason` 去空格；日期从文件名提取（`0205rejected_summary.csv` → 2月5日 + 侧边栏年份），文件名无 mmdd 跳过。入库同 daily SPS 覆盖式（先删同工区同日期旧坏炮），每行按 `(line, point)` 宽松匹配设计点，匹配到填 `design_point_id`，否则 NULL 也入库。上传时选对**年份**，否则日期可能错位（如坏炮 0205 落进 2026-02-05 的 work_day，而生产记录从 0206 起，属预期）。
+- daily SPS：解析行中**第 4 个字段为 attempt（激发次数）**，与 swath、is_rejected=0 一并写入 shot_attempt；`reject_reason` 为 NULL。
+- 坏炮 CSV：解析后 `Time` 去前导 `'`、`shot prompt` 空转 1、`RejectReason` 去空格；**CSV 可带 `swath` 列**（用于废炮匹配到正确束）；日期从文件名提取（`0205rejected_summary.csv` → 2月5日 + 侧边栏年份），文件名无 mmdd 跳过。入库按日期覆盖式重建（先删同工区同日期旧坏炮，**暂无"内容相同才跳过"保护**，与 daily 不同），每行按 `(line, point[, swath])` 宽松匹配设计点；**除写坏炮表外，匹配到的废炮会以 is_rejected=1 独立行镜像进 shot_attempt**（见上"废炮镜像进生产表"节）。上传时选对**年份**，否则日期可能错位（如坏炮 0205 落进 2026-02-05 的 work_day，而生产记录从 0206 起，属预期）。
 - 老"生产 obs (SPS)"上传路径不再入库（原 `daily_obs_db` 已废弃）。
 
 ## 绘图性能

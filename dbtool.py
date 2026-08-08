@@ -262,7 +262,7 @@ class Productiontool:
                     "SELECT COUNT(*) FROM shot_attempt sa "
                     "JOIN work_day wd ON wd.id = sa.work_day_id "
                     "JOIN project p ON p.id = wd.project_id "
-                    "WHERE p.name = ? AND wd.work_date BETWEEN ? AND ?",
+                    "WHERE p.name = ? AND wd.work_date BETWEEN ? AND ? AND sa.is_rejected = 0",
                     (project_name, start_date, end_date)
                 ).fetchone()   # 时间段内总炮数
             return f"{project_name} {start_date} 至 {end_date} 总炮数：{row[0]}"
@@ -275,7 +275,7 @@ class Productiontool:
                     "SELECT wd.work_date, COUNT(*) FROM shot_attempt sa "
                     "JOIN work_day wd ON wd.id = sa.work_day_id "
                     "JOIN project p ON p.id = wd.project_id "
-                    "WHERE p.name = ? AND wd.work_date BETWEEN ? AND ? "
+                    "WHERE p.name = ? AND wd.work_date BETWEEN ? AND ? AND sa.is_rejected = 0 "
                     "GROUP BY wd.work_date ORDER BY wd.work_date",
                     (project_name, start_date, end_date)
                 ).fetchall()   # 按天分组统计
@@ -296,7 +296,7 @@ class Productiontool:
                     "SELECT COUNT(*) FROM shot_attempt sa "
                     "JOIN work_day wd ON wd.id = sa.work_day_id "
                     "JOIN project p ON p.id = wd.project_id "
-                    "WHERE p.name = ? AND wd.work_date BETWEEN ? AND ?",
+                    "WHERE p.name = ? AND wd.work_date BETWEEN ? AND ? AND sa.is_rejected = 0",
                     (project_name, start_date, end_date)
                 ).fetchone()[0]   # 已完成炮数
             pct = f"{shots / design * 100:.1f}%" if design > 0 else "N/A"   # 百分比，防除零
@@ -309,7 +309,7 @@ class Productiontool:
                 rows = conn.execute(
                     "SELECT wd.work_date, COUNT(sa.id) FROM work_day wd "
                     "JOIN project p ON p.id = wd.project_id "
-                    "LEFT JOIN shot_attempt sa ON sa.work_day_id = wd.id "
+                    "LEFT JOIN shot_attempt sa ON sa.work_day_id = wd.id AND sa.is_rejected = 0 "
                     "WHERE p.name = ? GROUP BY wd.id ORDER BY wd.work_date",
                     (project_name,)
                 ).fetchall()   # 日期 + 当日炮数
@@ -461,6 +461,7 @@ class Productiontool:
                     "JOIN work_day wd ON wd.id = sa.work_day_id "
                     "JOIN project p ON p.id = wd.project_id "
                     "WHERE p.name = ? AND wd.work_date BETWEEN ? AND ? "
+                    "  AND sa.is_rejected = 0 "
                     "  AND CAST(substr(sa.gps_time, length(sa.gps_time) - 5, 2) AS INT) >= ? "
                     "  AND CAST(substr(sa.gps_time, length(sa.gps_time) - 5, 2) AS INT) < ? "
                     "GROUP BY wd.work_date ORDER BY wd.work_date",
@@ -514,7 +515,7 @@ class Productiontool:
         now = datetime.now()   # 当前时刻
         today = now.strftime("%Y-%m-%d")   # 今天
         this_month = now.strftime("%Y-%m")   # 本月
-        return f"""你是 S90 地震勘探生产数据助手。现在日期：{today}，第 {now.isocalendar()[1]} 周。
+        prompt = f"""你是 S90 地震勘探生产数据助手。现在日期：{today}，第 {now.isocalendar()[1]} 周。
 
 ### 日期推理
 - 本月：{this_month}-01 至 {today}
@@ -539,18 +540,36 @@ class Productiontool:
 - `project(id, name)` 工区；`name` 唯一。
 - `work_day(id, project_id, work_date)` 作业日；一天一行；`(project_id, work_date)` 唯一。项目名过滤用 `JOIN project p ON p.id = work_day.project_id WHERE p.name = ?`。
 - `design_point(id, project_id, line, point, x, y, batch_src, swath)` 设计点；`(project_id, line, point)` 唯一。`line`/`point` 是 TEXT 字符串（可能带 `.0` 后缀）。
-- `shot_attempt(id, work_day_id, design_point_id, elevation, gps_time, swath)` 生产炮；每炮挂一个作业日，外键 `work_day_id` 指向 `work_day.id`。炮数=该表行数。
+- `shot_attempt(id, work_day_id, design_point_id, elevation, gps_time, swath, attempt, is_rejected, reject_reason)` 生产炮；每炮挂一个作业日，外键 `work_day_id` 指向 `work_day.id`。`attempt`=激发次数、`is_rejected`=0合格/1废炮、`reject_reason`=废炮原因。**产量统计只算 is_rejected=0**。
 - `rejected_shot(id, project_id, work_day_id?, design_point_id?, line, point, shot_prompt, x, y, shot_time, reject_reason, src_file)` 坏炮；`work_day_id`/`design_point_id` 可空（未关联到作业日的坏炮会保留）。
 - 关联：生产炮按 `work_day_id` 关联作业日，坏炮按 `work_day_id` 关联作业日、按 `design_point_id` 关联设计点。
 - `gps_time` 是 9 位 `JJJHHMMSS`（也兼容 8 位），小时内含在 `substr(gps_time, length(gps_time)-5, 2)`（从后数第 6 位取 2 位），该表达式转 INT 后可与小时比较。
 
 ### 混合模式：业务工具优先，通用 SQL 兜底
 - 优先用上面的业务工具回答常见问题（进度、炮数、按天、坏炮、时效等），工具返回的数据直接引用，不要编造数字
+- **废炮独立行不算产量**：`shot_attempt` 里 is_rejected=1 的行是废炮（带原因/attempt），统计进度、炮数、时效、每天产量时只算 is_rejected=0 的合格炮；用户问"废炮/为什么废"时，数据来源既可以是坏炮工具（查 rejected_shot），也可以是查 shot_attempt 里 is_rejected=1 的行
 - 只有当没有任何业务工具能回答当前问题时，才根据上面的 Schema 自行编写一条只读 SELECT，调用 run_sql 兜底查询
 - run_sql 只读，禁止写成写操作（INSERT/UPDATE/DELETE/DROP/ALTER/CREATE）；执行前想好 WHERE 条件，避免一次查全库
-- 与生产数据无关的闲聊正常回答即可
+- 与生产数据无关的闲聊正常回答即可（不要附加图块）
 - 回答用简体中文
 """
+        # 出图指令单独作为普通字符串拼接（不能放进上面的 f-string：示例 JSON 里的花括号会被 f-string 当格式符解析，导致 Invalid format specifier）
+        chart_rules = """
+### 出图指令（仅当回答含表格型数值结果时可选；不是每条都出图，由你判断）
+- 当回答里包含表格型数值结果（如每天炮数、按原因坏炮数、按天的时效等，多行同构数据）时，可在回答末尾附一个 fenced 代码块让界面自动画图，格式为 ```` ```chart ```` 开头。例：
+
+```chart
+{"type": "timeseries", "title": "每日炮数", "columns": ["date", "shots"],
+ "rows": [["2026-08-01", 30214], ["2026-08-02", 29870]]}
+```
+
+- `type` 可选：`timeseries`（第1列是日期，画折线）、`bar`（普通分类柱状）、`pie`（占比饼图，rows每行 ["名称", 数值]）。图类型由你根据数据性质自定，不确定时用 bar。
+- `columns` 为列名数组（第1列画 x 轴/分类，其余为数值列）；`rows` 为二维数组数据行。值必须是数字或字符串，不要带单位、不要写省略号。
+- 同一回答最多给 1 个 chart 块；行数超过 30 时只取前 20 行代表性数据。
+- 回答里若没有"多行同构数值结果"（如只有单个数字、纯说明、闲聊），**不要**输出 chart 块。
+- chart 块是给界面画图用的，不计入正文；正文照常用自然语言给结论。
+"""
+        return prompt.rstrip() + "\n" + chart_rules   # 基础提示词 + 出图指令拼接返回
 
     def ask_stream(self, query: str, thread_id: str = "default"):
         """流式问答生成器：先流式输出推理过程，再逐 token 输出回答（带会话记忆）"""
